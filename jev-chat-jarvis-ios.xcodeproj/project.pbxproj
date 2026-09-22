@@ -6,8 +6,43 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		4D32167B53586A298C10431D /* VisynCapture in Frameworks */ = {isa = PBXBuildFile; productRef = 1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */; };
+		5CE9A6C1F7FA282FED7F5CBC /* JarvisBroadcastExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = DC0E29E5CA688E24A8B5242A /* JarvisBroadcastExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B46138095F5795515E07FE18 /* VisynBroadcast in Frameworks */ = {isa = PBXBuildFile; productRef = F9A3C929DA0E4707F0FE10B0 /* VisynBroadcast */; };
+		FD6A89AD749CB351767FC831 /* SampleHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAB1659D065D75EF7E9FAB88 /* SampleHandler.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F10DC8A1B5F4E367C9E35EF6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = DC5D1CF73062845E0033519A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C11AACE318D6317B3D01FD74;
+			remoteInfo = JarvisBroadcastExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		D6E4D017E4D4532A02FC1F85 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				5CE9A6C1F7FA282FED7F5CBC /* JarvisBroadcastExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		506E3BE0CF5FC4F4E2118ECA /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		98DC5746B0605AFEB74F5256 /* JarvisBroadcastExtension.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = JarvisBroadcastExtension.entitlements; sourceTree = "<group>"; };
+		DC0E29E5CA688E24A8B5242A /* JarvisBroadcastExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JarvisBroadcastExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC5D1CFF3062845E0033519A /* jev-chat-jarvis-ios.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "jev-chat-jarvis-ios.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		FAB1659D065D75EF7E9FAB88 /* SampleHandler.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SampleHandler.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -32,21 +67,41 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		5F04504B033C75CD68D47E0B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B46138095F5795515E07FE18 /* VisynBroadcast in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		DC5D1CFC3062845E0033519A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				4D32167B53586A298C10431D /* VisynCapture in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		51E81F31E4B9E7916C073EA6 /* JarvisBroadcastExtension */ = {
+			isa = PBXGroup;
+			children = (
+				FAB1659D065D75EF7E9FAB88 /* SampleHandler.swift */,
+				506E3BE0CF5FC4F4E2118ECA /* Info.plist */,
+				98DC5746B0605AFEB74F5256 /* JarvisBroadcastExtension.entitlements */,
+			);
+			path = JarvisBroadcastExtension;
+			sourceTree = "<group>";
+		};
 		DC5D1CF63062845E0033519A = {
 			isa = PBXGroup;
 			children = (
 				DC5D1D013062845E0033519A /* jev-chat-jarvis-ios */,
 				DC5D1D003062845E0033519A /* Products */,
+				51E81F31E4B9E7916C073EA6 /* JarvisBroadcastExtension */,
 			);
 			sourceTree = "<group>";
 		};
@@ -54,6 +109,7 @@
 			isa = PBXGroup;
 			children = (
 				DC5D1CFF3062845E0033519A /* jev-chat-jarvis-ios.app */,
+				DC0E29E5CA688E24A8B5242A /* JarvisBroadcastExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -61,6 +117,26 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		C11AACE318D6317B3D01FD74 /* JarvisBroadcastExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 565ADF5DF1922EBAD5D8B321 /* Build configuration list for PBXNativeTarget "JarvisBroadcastExtension" */;
+			buildPhases = (
+				C1FE030972864A9E24416CE7 /* Sources */,
+				5F04504B033C75CD68D47E0B /* Frameworks */,
+				3030B9917DB281BBD71C980F /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = JarvisBroadcastExtension;
+			packageProductDependencies = (
+				F9A3C929DA0E4707F0FE10B0 /* VisynBroadcast */,
+			);
+			productName = JarvisBroadcastExtension;
+			productReference = DC0E29E5CA688E24A8B5242A /* JarvisBroadcastExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		DC5D1CFE3062845E0033519A /* jev-chat-jarvis-ios */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = DC5D1D123062845F0033519A /* Build configuration list for PBXNativeTarget "jev-chat-jarvis-ios" */;
@@ -68,16 +144,19 @@
 				DC5D1CFB3062845E0033519A /* Sources */,
 				DC5D1CFC3062845E0033519A /* Frameworks */,
 				DC5D1CFD3062845E0033519A /* Resources */,
+				D6E4D017E4D4532A02FC1F85 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				4271A107D00BFF2B6B27C782 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				DC5D1D013062845E0033519A /* jev-chat-jarvis-ios */,
 			);
 			name = "jev-chat-jarvis-ios";
 			packageProductDependencies = (
+				1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */,
 			);
 			productName = "jev-chat-jarvis-ios";
 			productReference = DC5D1CFF3062845E0033519A /* jev-chat-jarvis-ios.app */;
@@ -93,8 +172,23 @@
 				LastSwiftUpdateCheck = 2660;
 				LastUpgradeCheck = 2660;
 				TargetAttributes = {
+					C11AACE318D6317B3D01FD74 = {
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+						};
+					};
 					DC5D1CFE3062845E0033519A = {
 						CreatedOnToolsVersion = 26.6;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+							com.apple.BackgroundModes = {
+								enabled = 1;
+							};
+						};
 					};
 				};
 			};
@@ -107,17 +201,28 @@
 			);
 			mainGroup = DC5D1CF63062845E0033519A;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = DC5D1D003062845E0033519A /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				DC5D1CFE3062845E0033519A /* jev-chat-jarvis-ios */,
+				C11AACE318D6317B3D01FD74 /* JarvisBroadcastExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		3030B9917DB281BBD71C980F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		DC5D1CFD3062845E0033519A /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -128,6 +233,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		C1FE030972864A9E24416CE7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FD6A89AD749CB351767FC831 /* SampleHandler.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		DC5D1CFB3062845E0033519A /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -137,28 +250,85 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		4271A107D00BFF2B6B27C782 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = JarvisBroadcastExtension;
+			target = C11AACE318D6317B3D01FD74 /* JarvisBroadcastExtension */;
+			targetProxy = F10DC8A1B5F4E367C9E35EF6 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		37F3E6F1719E356F2DBD83B3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = JarvisBroadcastExtension/JarvisBroadcastExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JarvisBroadcastExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Jarvis;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(VISYN_APP_BUNDLE_IDENTIFIER).BroadcastExtension";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		603CF2F2E3D1115799EBFA13 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = JarvisBroadcastExtension/JarvisBroadcastExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JarvisBroadcastExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Jarvis;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(VISYN_APP_BUNDLE_IDENTIFIER).BroadcastExtension";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		DC5D1D133062845F0033519A /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "jev-chat-jarvis-ios/Jarvis.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 43MJ7CT2NR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "jev-chat-jarvis-ios/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Jarvis;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.heself.jev-chat-jarvis-ios";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(VISYN_APP_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -175,22 +345,25 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "jev-chat-jarvis-ios/Jarvis.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 43MJ7CT2NR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "jev-chat-jarvis-ios/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Jarvis;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.heself.jev-chat-jarvis-ios";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(VISYN_APP_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -263,6 +436,8 @@
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				VISYN_APP_BUNDLE_IDENTIFIER = "com.heself.jev-chat-jarvis-ios";
+				VISYN_APP_GROUP = "group.$(VISYN_APP_BUNDLE_IDENTIFIER)";
 			};
 			name = Debug;
 		};
@@ -320,12 +495,23 @@
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
+				VISYN_APP_BUNDLE_IDENTIFIER = "com.heself.jev-chat-jarvis-ios";
+				VISYN_APP_GROUP = "group.$(VISYN_APP_BUNDLE_IDENTIFIER)";
 			};
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		565ADF5DF1922EBAD5D8B321 /* Build configuration list for PBXNativeTarget "JarvisBroadcastExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				37F3E6F1719E356F2DBD83B3 /* Release */,
+				603CF2F2E3D1115799EBFA13 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		DC5D1CFA3062845E0033519A /* Build configuration list for PBXProject "jev-chat-jarvis-ios" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -345,6 +531,26 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../Visyn;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */;
+			productName = VisynCapture;
+		};
+		F9A3C929DA0E4707F0FE10B0 /* VisynBroadcast */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */;
+			productName = VisynBroadcast;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = DC5D1CF73062845E0033519A /* Project object */;
 }
