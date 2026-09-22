@@ -2,6 +2,8 @@
 
 UIKit Home 页面，参考 Visyn Demo，提供系统录屏开关、画中画开关、录屏状态和收帧计数。
 
+业务接入架构见 [iOS 业务架构设计](docs/architecture/ios-business-architecture.md)，包括 OCR、跨屏会话合并、BYOK、语义分析、PiP 和 Jarvis 自定义键盘。
+
 ## 运行
 
 用 Xcode 打开 `jev-chat-jarvis-ios.xcodeproj`，选择 `jev-chat-jarvis-ios` scheme。
