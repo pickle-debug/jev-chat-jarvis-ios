@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		4D32167B53586A298C10431D /* VisynCapture in Frameworks */ = {isa = PBXBuildFile; productRef = 1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */; };
+		4D32167C53586A298C10431E /* Alamofire in Frameworks */ = {isa = PBXBuildFile; productRef = 1CDAF92FBDB25433A4A6C5C1 /* Alamofire */; };
 		5CE9A6C1F7FA282FED7F5CBC /* JarvisBroadcastExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = DC0E29E5CA688E24A8B5242A /* JarvisBroadcastExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		B46138095F5795515E07FE18 /* VisynBroadcast in Frameworks */ = {isa = PBXBuildFile; productRef = F9A3C929DA0E4707F0FE10B0 /* VisynBroadcast */; };
 		FD6A89AD749CB351767FC831 /* SampleHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAB1659D065D75EF7E9FAB88 /* SampleHandler.swift */; };
@@ -80,6 +81,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4D32167B53586A298C10431D /* VisynCapture in Frameworks */,
+				4D32167C53586A298C10431E /* Alamofire in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -157,6 +159,7 @@
 			name = "jev-chat-jarvis-ios";
 			packageProductDependencies = (
 				1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */,
+				1CDAF92FBDB25433A4A6C5C1 /* Alamofire */,
 			);
 			productName = "jev-chat-jarvis-ios";
 			productReference = DC5D1CFF3062845E0033519A /* jev-chat-jarvis-ios.app */;
@@ -203,6 +206,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */,
+				E3E4B154D2AB06FC7383CDA2 /* XCRemoteSwiftPackageReference "Alamofire" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = DC5D1D003062845E0033519A /* Products */;
@@ -539,11 +543,27 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		E3E4B154D2AB06FC7383CDA2 /* XCRemoteSwiftPackageReference "Alamofire" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Alamofire/Alamofire.git";
+			requirement = {
+				kind = exactVersion;
+				version = 5.11.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		1CDAF92EBDB25433A4A6C5C0 /* VisynCapture */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = E3E4B153D2AB06FC7383CDA1 /* XCLocalSwiftPackageReference "../Visyn" */;
 			productName = VisynCapture;
+		};
+		1CDAF92FBDB25433A4A6C5C1 /* Alamofire */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E3E4B154D2AB06FC7383CDA2 /* XCRemoteSwiftPackageReference "Alamofire" */;
+			productName = Alamofire;
 		};
 		F9A3C929DA0E4707F0FE10B0 /* VisynBroadcast */ = {
 			isa = XCSwiftPackageProductDependency;

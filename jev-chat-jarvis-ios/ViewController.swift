@@ -8,6 +8,8 @@ final class ViewController: UIViewController {
     private let errorLabel = UILabel()
     private let recordButton = UIButton(configuration: .filled())
     private let pipButton = UIButton(configuration: .tinted())
+    private let analysisButton = UIButton(configuration: .tinted())
+    private let settingsButton = UIButton(configuration: .gray())
     private var receivedFrames = 0
 
     override func viewDidLoad() {
@@ -94,7 +96,17 @@ final class ViewController: UIViewController {
             self?.errorLabel.isHidden = true
             self?.capture?.togglePictureInPicture()
         }, for: .touchUpInside)
-        for button in [recordButton, pipButton] {
+        analysisButton.configuration?.title = "手动分析"
+        analysisButton.configuration?.image = UIImage(systemName: "sparkles")
+        analysisButton.addAction(UIAction { [weak self] _ in
+            self?.present(AnalysisViewController())
+        }, for: .touchUpInside)
+        settingsButton.configuration?.title = "BYOK 设置"
+        settingsButton.configuration?.image = UIImage(systemName: "key")
+        settingsButton.addAction(UIAction { [weak self] _ in
+            self?.present(SettingsViewController())
+        }, for: .touchUpInside)
+        for button in [recordButton, pipButton, analysisButton, settingsButton] {
             button.configuration?.imagePadding = 10
             button.configuration?.cornerStyle = .large
             button.configuration?.contentInsets = .init(top: 16, leading: 20, bottom: 16, trailing: 20)
@@ -113,7 +125,7 @@ final class ViewController: UIViewController {
         view.addSubview(scrollView)
         let stack = UIStackView(arrangedSubviews: [
             titleLabel, subtitleLabel, statusLabel, frameLabel,
-            errorLabel, recordButton, pipButton, hintLabel
+            errorLabel, recordButton, pipButton, analysisButton, settingsButton, hintLabel
         ])
         stack.axis = .vertical
         stack.spacing = 16
@@ -144,5 +156,18 @@ final class ViewController: UIViewController {
         label.textColor = .black
         label.backgroundColor = .white
         return label
+    }
+
+    /// 主页是 storyboard 里的裸 view controller，没有导航栈，
+    /// 所以包一层 UINavigationController 来拿到标题栏和关闭按钮。
+    private func present(_ viewController: UIViewController) {
+        let navigation = UINavigationController(rootViewController: viewController)
+        viewController.navigationItem.rightBarButtonItem = UIBarButtonItem(
+            systemItem: .done,
+            primaryAction: UIAction { [weak navigation] _ in
+                navigation?.dismiss(animated: true)
+            }
+        )
+        present(navigation, animated: true)
     }
 }
