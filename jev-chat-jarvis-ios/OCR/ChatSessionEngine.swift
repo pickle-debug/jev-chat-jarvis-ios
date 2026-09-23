@@ -22,6 +22,8 @@ nonisolated struct LiveSegmentSummary: Sendable {
     let imageSpan: Int
     /// 长梯当前保留的截图张数（去重后）。
     let rungCount: Int
+    /// 在段链里的位置：0 = 含最新消息，越大越早；nil = 没接上链的孤立片段。
+    let chainIndex: Int?
 }
 
 /// 引擎每处理一帧给出的状态快照。只含展示和分析需要的数据，不含像素。
@@ -154,10 +156,16 @@ actor ChatSessionEngine {
         lastThumbnail = thumbnail
         framesProcessed += 1
 
-        let lines = rawLines.filter { line in
-            !overlayMarkers.contains { line.text.hasPrefix($0) }
+        let (lines, keyboardTop, occluders) = Self.excludeJarvisUI(rawLines, markers: overlayMarkers, frameSize: bitmap.size)
+        var parsed = parser.parse(
+            lines: lines, bitmap: bitmap, frameID: frameID, capturedAt: capturedAt,
+            anchors: anchors, jarvisKeyboardTop: keyboardTop, occluders: occluders
+        )
+        // 整屏都是图片、一条文字消息都没有：只要标题还是这个会话，就是同一个聊天页，不能切断会话。
+        if !parsed.isChat, inChat, parsed.messageBubbles.isEmpty, conversationID != nil,
+           continuesConversation(parsed) {
+            parsed = parsed.continuingChat(reason: "这一屏没有文字消息（可能都是图片）")
         }
-        let parsed = parser.parse(lines: lines, bitmap: bitmap, frameID: frameID, capturedAt: capturedAt, anchors: anchors)
 
         lastFrameWasChat = parsed.isChat
         guard parsed.isChat else {
@@ -230,6 +238,40 @@ actor ChatSessionEngine {
 
     // MARK: - 内部
 
+    /// 把 Jarvis 自己的界面从 OCR 结果里拿掉，避免“自己的建议被识别成聊天消息”的反馈循环（架构文档 §5.3）。
+    /// - 画中画：每行以 “Jarvis” 开头。找到标记行后，按画中画 414:80 的比例推出整块区域，区域内的行全部丢弃；
+    /// - Jarvis 键盘：顶部固定写 “Jarvis 键盘”。它下面全是键盘，返回它的顶边作为内容区下限。
+    /// 只按区域排除，不做全局文字过滤：用户把候选发出去后，同样的文字会成为真正的聊天气泡。
+    static func excludeJarvisUI(
+        _ lines: [OCRLine], markers: [String], frameSize: CGSize
+    ) -> (lines: [OCRLine], keyboardTop: CGFloat?, occluders: [CGRect]) {
+        let keyboardHeader = lines
+            .filter { $0.text.hasPrefix("Jarvis 键盘") || $0.text.hasPrefix("Jarvis键盘") }
+            .filter { $0.rect.midY > 0.4 * frameSize.height }
+            .min { $0.rect.minY < $1.rect.minY }
+        var regions: [CGRect] = []
+        for line in lines where markers.contains(where: { line.text.hasPrefix($0) }) && line != keyboardHeader {
+            // 画中画一行文字高约为窗口高的 1/5.5，窗口宽高比 414:80。
+            let height = max(line.rect.height * 5.5, 40)
+            let width = height * 414 / 80
+            regions.append(CGRect(x: line.rect.minX - 0.1 * width, y: line.rect.minY - 0.45 * height,
+                                  width: width * 1.15, height: height * 1.1))
+        }
+        let kept = lines.filter { line in
+            if markers.contains(where: { line.text.hasPrefix($0) }) { return false }
+            if let keyboardHeader, line.rect.minY >= keyboardHeader.rect.minY - 2 { return false }
+            return !regions.contains { $0.contains(CGPoint(x: line.rect.midX, y: line.rect.midY)) }
+        }
+        return (kept, keyboardHeader?.rect.minY, regions)
+    }
+
+    /// 这一帧看起来还是当前会话：标题一致，或者标题被遮住但帧尺寸没变、刚刚还在这个聊天页里。
+    private func continuesConversation(_ parsed: ParsedChatFrame) -> Bool {
+        guard let current = conversationTitle else { return parsed.title == nil }
+        guard let title = parsed.title, !ChatLayoutParser.isTransientTitle(title) else { return true }
+        return TextMatch.similarity(TextMatch.normalize(title), TextMatch.normalize(current)) >= 0.6
+    }
+
     private func nonChatFrame(frameID: UUID, reason: String, skipped: Bool, ocrMs: Int) -> EngineUpdate {
         nonChatStreak += 1
         chatStreak = 0
@@ -272,18 +314,33 @@ actor ChatSessionEngine {
     private func makeUpdate(
         frameID: UUID, detection: EngineUpdate.Detection, placement: StitchPlacement.Kind?, skipped: Bool, ocrMs: Int
     ) -> EngineUpdate {
+        let chain = stitcher.chain
         let summaries = stitcher.segments.map { segment in
             LiveSegmentSummary(
                 id: segment.id, isLive: segment.isLive,
-                messages: segment.entries.map(Self.message),
+                // 只把文字确认过的消息交给对话列表和分析：画面位移放进来的图片小字不进上下文。
+                messages: segment.entries.filter(\.textConfirmed).map(Self.message),
                 imageSpan: ladders[segment.id]?.span ?? 0,
-                rungCount: ladders[segment.id]?.rungs.count ?? 0
+                rungCount: ladders[segment.id]?.rungs.count ?? 0,
+                chainIndex: chain.firstIndex(of: segment.id)
             )
         }
-        let live = summaries.first { $0.isLive }?.messages ?? []
+        // 分析上下文：沿段链从最早到最新接起来。段与段之间插一条缺口占位，
+        // 表示“这里有没截到的记录”，但顺序是确定的，所以更早的消息仍然能作为上下文。
+        var live: [LiveMessage] = []
+        for id in chain.reversed() {
+            guard let segment = summaries.first(where: { $0.id == id }) else { continue }
+            if !live.isEmpty {
+                live.append(LiveMessage(
+                    id: segment.id, kind: .gap, side: .unknown, sideConfidence: 0,
+                    text: "中间有未识别的聊天记录", senderName: nil, quote: nil, observations: 0, clipped: false
+                ))
+            }
+            live += segment.messages
+        }
         var hasher = Hasher()
         hasher.combine(conversationID)
-        for message in live {
+        for message in live where message.kind != .gap {
             hasher.combine(message.kind.rawValue)
             hasher.combine(message.side.rawValue)
             hasher.combine(TextMatch.normalize(message.text))

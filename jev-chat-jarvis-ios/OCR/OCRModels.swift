@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 
 /// 一行 OCR 文字。`rect` 是帧像素坐标，原点在左上角（已从 Vision 的左下归一化坐标换算）。
-nonisolated struct OCRLine: Sendable {
+nonisolated struct OCRLine: Sendable, Equatable {
     let text: String
     let rect: CGRect
     let confidence: Float
@@ -19,6 +19,8 @@ nonisolated enum BubbleSide: String, Sendable {
 nonisolated enum BubbleKind: String, Sendable {
     case message
     case time
+    /// 不是识别出来的内容，而是“这里有一段没截到的聊天记录”的占位。
+    case gap
 }
 
 /// 一帧里解析出的一个聊天气泡（一条或多条相邻 OCR 行），或一条时间分隔线。
@@ -61,10 +63,28 @@ nonisolated struct ParsedChatFrame: Sendable {
     /// 从上到下排序，包括时间分隔线。
     let bubbles: [ChatBubble]
     let keyboardVisible: Bool
+    /// 本帧测到的正文字高，用来过滤图片里的小字，也用于学习本会话的稳定字高。
+    let bodyLineHeight: CGFloat
+    /// Jarvis 自己的界面（画中画）在帧里占掉的区域，压住的气泡按“显示不完整”处理。
+    let occluders: [CGRect]
     /// 不是聊天页时的原因，只用于状态展示，不含聊天内容。
     let rejectReason: String?
 
     var messageBubbles: [ChatBubble] { bubbles.filter { $0.kind == .message } }
+
+    /// 一条消息都没有，但确实是同一个聊天页（整屏都是图片时会出现）。
+    /// 不能当成“不是聊天页”，否则会把会话切断。
+    func continuingChat(reason: String) -> ParsedChatFrame {
+        ParsedChatFrame(
+            frameID: frameID, capturedAt: capturedAt, pixelSize: pixelSize, chatScore: chatScore, isChat: true,
+            title: title, titleAnchored: titleAnchored, contentTop: contentTop, contentBottom: contentBottom,
+            headerBottom: headerBottom, bubbles: bubbles, keyboardVisible: keyboardVisible,
+            bodyLineHeight: bodyLineHeight, occluders: occluders, rejectReason: reason
+        )
+    }
+
+    /// 帧里有没有被 Jarvis 界面压住的行（判断能否放宽跨帧对齐的冲突阈值）。
+    var hasOcclusion: Bool { !occluders.isEmpty }
 }
 
 /// 按会话累积的版式知识：标题栏高度、两侧气泡边缘、两侧气泡颜色。
@@ -77,9 +97,15 @@ nonisolated struct LayoutAnchors: Sendable {
     private(set) var contentTops: [CGFloat] = []
     private(set) var meColors: [RGB] = []
     private(set) var otherColors: [RGB] = []
+    private(set) var bodyHeights: [CGFloat] = []
 
     mutating func record(_ frame: ParsedChatFrame) {
         if frame.titleAnchored { Self.push(&contentTops, frame.contentTop) }
+        // 正文行高：只统计确实分出了左右的消息，避免把图片里的小字当成正文。
+        let strong = frame.bubbles.filter {
+            $0.kind == .message && $0.sideConfidence >= 0.8 && !$0.clipped
+        }
+        if strong.count >= 2, frame.bodyLineHeight > 0 { Self.push(&bodyHeights, frame.bodyLineHeight) }
         for bubble in frame.bubbles where bubble.kind == .message && !bubble.clipped && bubble.sideConfidence >= 0.9 {
             switch bubble.side {
             case .other:
@@ -97,6 +123,8 @@ nonisolated struct LayoutAnchors: Sendable {
     var otherLeftMedian: CGFloat? { Self.median(otherLeft, minimum: 3) }
     var meRightMedian: CGFloat? { Self.median(meRight, minimum: 3) }
     var contentTopMedian: CGFloat? { Self.median(contentTops, minimum: 1) }
+    /// 本会话学到的正文字高；学到之前由单帧的分位估算兜底。
+    var bodyHeight: CGFloat? { Self.median(bodyHeights, minimum: 2) }
     var meColor: RGB? { Self.median(meColors) }
     var otherColor: RGB? { Self.median(otherColors) }
 

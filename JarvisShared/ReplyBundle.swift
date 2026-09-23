@@ -1,0 +1,117 @@
+import Foundation
+
+/// 主 App 与 Jarvis 键盘之间的候选回复契约（架构文档 §8.3）。
+///
+/// 主 App 通过临时文件 + 原子替换写入 App Group 里的 `Jarvis/reply-bundle.json`；
+/// 键盘只读，不联网、不持有 API Key、不读屏幕帧。键盘每次展示和点击都要重新校验。
+nonisolated struct ReplyBundle: Codable, Equatable, Sendable {
+    static let currentSchema = 1
+
+    enum Status: String, Codable, Sendable {
+        case ready
+        case invalid
+    }
+
+    struct Candidate: Codable, Equatable, Sendable {
+        let id: String
+        /// 展示次序：1 最低，3 最高（优先推荐）。
+        let rank: Int
+        let text: String
+    }
+
+    var schemaVersion = ReplyBundle.currentSchema
+    var bundleID: String
+    var status: Status
+    var sessionID: String
+    var conversationID: String
+    var revision: Int
+    var analysisRequestID: String
+    var generatedAt: Date
+    /// 推荐的最长有效时间，不会被续期超过。
+    var expiresAt: Date
+    /// 来源新鲜度：主 App 仍看到同一会话、同一内容时才续期。
+    var validUntil: Date
+    var sourceTitle: String
+    var sourceConfidence: String
+    /// 判断结论的一句话摘要，键盘顶部展示。
+    var summary: String?
+    var candidates: [Candidate]
+    /// invalid 时的原因（展示用）。
+    var note: String?
+
+    static func invalid(note: String) -> ReplyBundle {
+        let now = Date()
+        return ReplyBundle(
+            bundleID: UUID().uuidString, status: .invalid, sessionID: "", conversationID: "", revision: 0,
+            analysisRequestID: "", generatedAt: now, expiresAt: now, validUntil: now,
+            sourceTitle: "", sourceConfidence: "unknown", summary: nil, candidates: [], note: note
+        )
+    }
+
+    /// 键盘可以插入的条件。时间异常（设备时钟回拨到生成之前）一律视为失效。
+    func isUsable(now: Date = Date()) -> Bool {
+        schemaVersion == Self.currentSchema
+            && status == .ready
+            && sourceConfidence == "confirmed"
+            && candidates.count == 3
+            && candidates.allSatisfy { !$0.text.isEmpty && $0.text.count <= 120 }
+            && now >= generatedAt.addingTimeInterval(-5)
+            && now < expiresAt
+            && now < validUntil
+    }
+}
+
+/// 读写 `reply-bundle.json`。主 App 负责建目录和写；键盘只调用 `load()`。
+nonisolated enum ReplyBundleStore {
+    private static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }()
+
+    /// App Group 标识来自 Info.plist 的 `VisynAppGroupIdentifier`（主 App 与键盘都配置了同一个值）。
+    static var fileURL: URL? {
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "VisynAppGroupIdentifier") as? String,
+              !group.isEmpty, !group.hasPrefix("$("),
+              let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
+        else { return nil }
+        return container.appendingPathComponent("Jarvis", isDirectory: true)
+            .appendingPathComponent("reply-bundle.json")
+    }
+
+    static func load() -> ReplyBundle? {
+        guard let url = fileURL, let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(ReplyBundle.self, from: data)
+    }
+
+    static func modificationDate() -> Date? {
+        guard let url = fileURL else { return nil }
+        return (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    /// 主 App 专用：原子写入，设文件保护并排除备份（候选和联系人标题属于敏感的聊天衍生数据）。
+    @discardableResult
+    static func write(_ bundle: ReplyBundle) -> Bool {
+        guard let url = fileURL, let data = try? encoder.encode(bundle) else { return false }
+        let directory = url.deletingLastPathComponent()
+        do {
+            if !FileManager.default.fileExists(atPath: directory.path) {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                var excluded = directory
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                try? excluded.setResourceValues(values)
+            }
+            try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            return true
+        } catch {
+            return false
+        }
+    }
+}

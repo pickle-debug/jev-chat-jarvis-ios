@@ -17,6 +17,10 @@ nonisolated struct TranscriptEntry: Sendable {
     var clippedBottom: Bool
     var senderName: String?
     var quote: String?
+    /// 这条消息足够可信，可以进对话列表和分析上下文。
+    /// 一帧里看到一次可能只是噪声（整屏图片时图上的小字会被识别成行），
+    /// 但只要在两帧里被稳定看到（同一位置、同一文字），它就在随聊天滚动，是真实消息。
+    var textConfirmed: Bool
     var observations: Int
     var misses: Int
     var firstSeen: Date
@@ -31,10 +35,13 @@ nonisolated struct TranscriptEntry: Sendable {
 }
 
 /// 一段连续的对话。快速滚动、跳转历史导致没有重叠时，另起一段，不硬拼。
+///
+/// 各段之间用 `chain` 记先后：链首是包含最新消息的一段，往后依次更早。链上相邻两段之间
+/// 可能有未截到的内容（`BubbleKind.gap`），但顺序是确定的，所以分析上下文能把它们接起来。
 nonisolated struct TranscriptSegment: Sendable {
     let id: UUID
     var entries: [TranscriptEntry] = []
-    /// 是否包含最新消息（进入会话时看到的底部那段）。只有它的新消息会触发自动分析。
+    /// 是否包含最新消息。等于“是本段链的链首”，由 `refreshLiveFlags` 统一计算。
     var isLive: Bool
     var coveredTop: CGFloat = .greatestFiniteMagnitude
     var coveredBottom: CGFloat = -.greatestFiniteMagnitude
@@ -51,6 +58,8 @@ nonisolated struct StitchPlacement: Sendable {
 
     let kind: Kind
     let segmentID: UUID
+    /// 这一段在链里的位置：0 = 含最新消息的一段，越大越早。
+    let chainIndex: Int
     /// 帧坐标 + offset = 片段全局坐标。
     let offset: CGFloat
     /// 本帧相对上一帧的滚动量（同一段内才有）。负值 = 往上翻历史，正值 = 往下看更新的消息。
@@ -72,9 +81,33 @@ nonisolated struct StitchPlacement: Sendable {
 /// 为什么不用整行像素对齐：微信等 App 的聊天背景（尤其是照片壁纸）固定不动，只有气泡在滚动，
 /// 整行亮度曲线会被背景拉向“没滚动”。这里只比对气泡文字区域内的像素。
 nonisolated final class ChatStitcher {
+    private struct Last {
+        let segmentID: UUID
+        let offset: CGFloat
+        let bitmap: FrameBitmap
+        let motion: MotionFrame?
+        let top: CGFloat
+        let bottom: CGFloat
+        /// 本帧相对上一帧的滚动量（帧坐标，正 = 内容上移 = 在看更新的消息）。
+        let scrollDelta: CGFloat
+    }
+
     private(set) var segments: [TranscriptSegment] = []
     private(set) var currentSegmentID: UUID?
-    private var last: (segmentID: UUID, offset: CGFloat, bitmap: FrameBitmap, top: CGFloat, bottom: CGFloat)?
+    /// 段链：链首含最新消息，依次更早。只有链上的段会带来分析上下文。
+    private(set) var chain: [UUID] = []
+    private var last: Last?
+    private var lastCaptureAt = Date.distantPast
+    /// 最近一次 offset 估计中有多少条不同消息被文字印证。
+    private var lastVotes = 0
+    /// 最近一帧的位置是文字证据给的，还是只靠画面位移估的。
+    private var lastPlacementFromText = false
+    /// 最近一帧的文字偏移和画面位移互相印证（两套独立证据一致）。
+    private var lastOffsetCorroborated = false
+    private let motion = MotionEstimator()
+
+    /// 相邻两帧间隔超过这个时间就认为中间可能有没截到的内容。
+    static let continuityWindow: TimeInterval = 3
 
     static let maxSegments = 6
     /// 每段最多保留的条目数。超出时丢掉离当前画面最远的一端。
@@ -90,66 +123,146 @@ nonisolated final class ChatStitcher {
 
     func reset() {
         segments = []
+        chain = []
         currentSegmentID = nil
         last = nil
+        motion.reset()
+    }
+
+    /// 链上的段按“从最新到最早”排列。
+    var chainedSegments: [TranscriptSegment] {
+        chain.compactMap { id in segments.first { $0.id == id } }
+    }
+
+    private func refreshLiveFlags() {
+        let liveID = chain.first
+        for i in segments.indices { segments[i].isLive = segments[i].id == liveID }
     }
 
     /// 离开聊天页后回来：保留片段，但上一帧不能再作为像素微调参考。
     func markInterrupted() {
         last = nil
+        lastCaptureAt = .distantPast
     }
 
     func ingest(_ frame: ParsedChatFrame, bitmap: FrameBitmap, preferLiveOnNewSegment: Bool) -> StitchPlacement? {
-        guard !frame.messageBubbles.isEmpty else { return nil }
+        let motionFrame = MotionFrame(bitmap: bitmap, contentTop: frame.contentTop, contentBottom: frame.contentBottom)
+        let previous = last
+        // 和上一帧差不多是连续的（同一会话、间隔很短）。
+        let continuous = previous.map {
+            frame.capturedAt.timeIntervalSince(lastCaptureAt) < Self.continuityWindow
+                && $0.bitmap.width == bitmap.width && $0.bitmap.height == bitmap.height
+        } ?? false
 
         var kind: StitchPlacement.Kind = .extended
-        var target: UUID
-        var offset: CGFloat
+        var target: UUID?
+        var offset: CGFloat = 0
+        lastPlacementFromText = false
+        lastOffsetCorroborated = false
 
-        let current = currentSegmentID.flatMap { id in segments.firstIndex { $0.id == id } }
-        let hint = last.flatMap { $0.segmentID == currentSegmentID ? $0.offset : nil }
-        if let current, var found = estimateOffset(frame.bubbles, into: segments[current], hint: hint) {
-            if let last, last.segmentID == segments[current].id {
-                found = refine(found, frame: frame, bitmap: bitmap, previous: last)
-            }
-            target = segments[current].id
+        // 先算一次“画面位移”，既用于没有文字时的兜底，也用于给文字对齐做交叉验证。
+        var motionShift: Int?
+        var usedMotion = false
+        if let previous, continuous, let current = motionFrame, let prevMotion = previous.motion {
+            let predicted = abs(previous.scrollDelta) > 8
+                ? Int((previous.scrollDelta / CGFloat(current.step)).rounded()) : nil
+            motionShift = motion.estimate(current: current, previous: prevMotion, predicted: predicted)
+        }
+        if let previous, continuous, let index = segments.firstIndex(where: { $0.id == previous.segmentID }),
+           !frame.messageBubbles.isEmpty,
+           var found = estimateOffset(frame.bubbles, into: segments[index], hint: previous.offset,
+                                      occluders: frame.occluders,
+                                      motionOffset: motionShift.map { previous.offset + CGFloat($0) }) {
+            found = refine(found, frame: frame, bitmap: bitmap, previous: previous)
+            target = previous.segmentID
             offset = found
-        } else if let (index, found) = bestOtherSegment(frame.bubbles, excluding: currentSegmentID) {
+            lastPlacementFromText = lastVotes >= 1 || lastOffsetCorroborated
+            // 文字对齐成功：这是“已知位移”的帧对，用来学习静止掩码。
+            if let current = motionFrame, let prevMotion = previous.motion {
+                motion.learn(current: current, previous: prevMotion, shift: Int((offset - previous.offset) / CGFloat(current.step)))
+            }
+        } else if let previous, continuous, previous.segmentID == currentSegmentID {
+            // 没有文字可对齐（整屏都是图片）：用画面本身的位移接上。
+            if let shift = motionShift {
+                target = previous.segmentID
+                offset = previous.offset + CGFloat(shift)
+                usedMotion = true
+                if let index = segments.firstIndex(where: { $0.id == previous.segmentID }),
+                   contradicts(frame, segment: segments[index], offset: offset) { target = nil }
+            }
+        }
+        if target == nil, !frame.messageBubbles.isEmpty,
+           let (index, found) = bestOtherSegment(frame.bubbles, excluding: currentSegmentID, occluders: frame.occluders) {
             kind = .rejoined
             target = segments[index].id
             offset = found
-        } else {
-            kind = .newSegment
-            let hasLive = segments.contains { $0.isLive }
-            let segment = TranscriptSegment(id: UUID(), isLive: !hasLive || preferLiveOnNewSegment, createdAt: frame.capturedAt)
-            if segment.isLive {
-                for i in segments.indices { segments[i].isLive = false }
-            }
-            segments.append(segment)
-            if segments.count > Self.maxSegments,
-               let drop = segments.firstIndex(where: { !$0.isLive && $0.id != segment.id }) {
-                segments.remove(at: drop)
-            }
-            target = segment.id
-            offset = 0
         }
-
+        guard let target else {
+            // 完全接不上：另起一段。按上一帧相对上一段的位置判断新的一段更早还是更新，接到链上。
+            return startSegment(frame: frame, bitmap: bitmap, previous: previous, motionFrame: motionFrame,
+                                preferLive: preferLiveOnNewSegment)
+        }
         guard let index = segments.firstIndex(where: { $0.id == target }) else { return nil }
+
         let scrollDelta: CGFloat? = {
-            guard let last, last.segmentID == target, kind == .extended else { return nil }
-            return offset - last.offset
+            guard let previous, previous.segmentID == target, kind == .extended else { return nil }
+            return offset - previous.offset
         }()
-        let changed = merge(frame, offset: offset, into: index)
+        let changed = merge(frame, offset: offset, into: index, textBacked: lastPlacementFromText && !usedMotion)
         currentSegmentID = target
-        last = (target, offset, bitmap, frame.contentTop, frame.contentBottom)
+        lastCaptureAt = frame.capturedAt
+        last = Last(segmentID: target, offset: offset, bitmap: bitmap, motion: motionFrame,
+                    top: frame.contentTop, bottom: frame.contentBottom, scrollDelta: scrollDelta ?? 0)
 
         let merged = absorbOverlappingSegments(
             into: target, viewTop: frame.contentTop + offset, viewBottom: frame.contentBottom + offset
         )
         return StitchPlacement(
-            kind: kind, segmentID: target, offset: offset, scrollDelta: scrollDelta,
-            merged: merged, changed: changed || !merged.isEmpty
+            kind: kind, segmentID: target, chainIndex: chain.firstIndex(of: target) ?? chain.count,
+            offset: offset, scrollDelta: scrollDelta, merged: merged, changed: changed || !merged.isEmpty
         )
+    }
+
+    /// 接不上时另起一段，并按上一帧的位置把它接到链的更早或更新一端。
+    private func startSegment(
+        frame: ParsedChatFrame, bitmap: FrameBitmap, previous: Last?, motionFrame: MotionFrame?, preferLive: Bool
+    ) -> StitchPlacement? {
+        let segment = TranscriptSegment(id: UUID(), isLive: false, createdAt: frame.capturedAt)
+        segments.append(segment)
+        if segments.count > Self.maxSegments {
+            // 优先丢掉没接进链的段；都接上了就丢链尾（最早的一段）。
+            let unlinked = segments.first { !chain.contains($0.id) && $0.id != segment.id }
+            if let unlinked {
+                segments.removeAll { $0.id == unlinked.id }
+            } else if chain.count > 1 {
+                segments.removeAll { $0.id == chain.removeLast() }
+            }
+        }
+        // 依据上一帧相对上一段的位置判断方向：靠近上边缘 = 往上翻历史。
+        var older = preferLive
+        if let previous, let index = segments.firstIndex(where: { $0.id == previous.segmentID }) {
+            let spread = max(segments[index].coveredBottom - segments[index].coveredTop, 1)
+            let nearTop = (frame.contentTop + previous.offset - segments[index].coveredTop) / spread < 0.45
+            let nearBottom = (segments[index].coveredBottom - (frame.contentBottom + previous.offset)) / spread < 0.45
+            older = nearTop && !nearBottom
+            if nearTop == nearBottom { older = previous.scrollDelta < 0 }
+        }
+        if older, let position = chain.firstIndex(of: previous?.segmentID ?? UUID()) {
+            chain.insert(segment.id, at: position + 1)
+        } else {
+            chain.insert(segment.id, at: 0)
+        }
+        refreshLiveFlags()
+        currentSegmentID = segment.id
+        lastCaptureAt = frame.capturedAt
+        last = Last(segmentID: segment.id, offset: 0, bitmap: bitmap, motion: motionFrame,
+                    top: frame.contentTop, bottom: frame.contentBottom, scrollDelta: 0)
+        // 新段的第一帧：位置就是它自己，没有可比对的对象，以文字证据为准。
+        let changed = merge(frame, offset: 0, into: segments.count - 1, textBacked: true)
+        guard let placed = segments.firstIndex(where: { $0.id == segment.id }) else { return nil }
+        return StitchPlacement(kind: .newSegment, segmentID: segment.id,
+                               chainIndex: chain.firstIndex(of: segment.id) ?? 0,
+                               offset: 0, scrollDelta: nil, merged: [], changed: changed || placed >= 0)
     }
 
     /// 画面没变（缩略图相同）时调用：可见范围内的消息多观察一次，用于判断稳定。
@@ -173,10 +286,14 @@ nonisolated final class ChatStitcher {
     // MARK: - 偏移估计
 
     /// 在片段里找这一屏的位置。返回帧 → 片段的平移量；证据不足返回 nil。
-    private func estimateOffset(_ bubbles: [ChatBubble], into segment: TranscriptSegment, hint: CGFloat?) -> CGFloat? {
+    private func estimateOffset(
+        _ bubbles: [ChatBubble], into segment: TranscriptSegment, hint: CGFloat?, occluders: [CGRect] = [],
+        motionOffset: CGFloat? = nil
+    ) -> CGFloat? {
         guard !segment.entries.isEmpty else { return nil }
         struct Vote { let delta: CGFloat; let weight: Double; let entry: Int }
         var votes: [Vote] = []
+        lastVotes = 0
         for bubble in bubbles {
             let normalized = TextMatch.normalize(bubble.text)
             guard !normalized.isEmpty else { continue }
@@ -196,7 +313,10 @@ nonisolated final class ChatStitcher {
                 }
                 // 时间分隔线字数少、同一天里可能重复，只作辅助证据。
                 let kindWeight = bubble.kind == .time ? 0.4 : 1.0
-                let weight = similarity * min(Double(normalized.count), 12) / 12 * (bubble.clipped ? 0.5 : 1) * kindWeight
+                var weight = similarity * min(Double(normalized.count), 12) / 12 * (bubble.clipped ? 0.5 : 1) * kindWeight
+                // 文字被截断（画中画压住、或没识别全）时，完整的那次观察更可信。
+                if bubble.clipped && abs(normalized.count - entry.normalized.count) > 2 { weight *= 0.6 }
+                if !bubble.clipped && normalized.count == entry.normalized.count { weight *= 1.1 }
                 votes.append(Vote(delta: delta, weight: weight, entry: entryIndex))
             }
         }
@@ -212,6 +332,7 @@ nonisolated final class ChatStitcher {
             return Cluster(center: center, weight: weight, distinct: Set(members.map(\.entry)).count)
         }
         guard var chosen = clusters.max(by: { $0.weight < $1.weight }) else { return nil }
+        lastVotes = chosen.distinct
         let rival = clusters
             .filter { abs($0.center - chosen.center) > 2 * tolerance }
             .max { $0.weight < $1.weight }
@@ -220,36 +341,68 @@ nonisolated final class ChatStitcher {
             guard let hint else { return nil }
             chosen = abs(rival.center - hint) < abs(chosen.center - hint) ? rival : chosen
         }
-        // 至少两条消息互相印证，或者一条足够长的消息（短句单独出现不足以确认重叠）。
-        guard chosen.distinct >= 2 || chosen.weight >= 0.7 else { return nil }
-        // 几何复核：按这个偏移，落在片段已覆盖范围内的其他气泡也必须在对应位置找到同一条消息。
-        // 格式化、相似度高的不同消息（“第 3 条…”“第 30 条…”）会给出看似一致的错误偏移，这里拦下。
-        guard verify(bubbles, in: segment, offset: chosen.center) else { return nil }
+        // 先用两套独立证据互相印证：文字偏移和画面位移落在同一个位置，就没有疑问了。
+        if let motionOffset, abs(motionOffset - chosen.center) <= 4 {
+            lastVotes = max(chosen.distinct, 1)
+            lastOffsetCorroborated = true
+            return chosen.center
+        }
+        // 否则看文字证据够不够：至少两条消息互相印证；或者一条足够长、相似度很高的消息——
+        // 长句几乎不可能在别处重复，一条就够（整屏都是图片、只剩一两条文字气泡时很常见）。
+        // 短句（“好”“嗯”）不在此列：同一会话里可能重复出现几次。
+        let longEnough = chosen.distinct == 1 && chosen.weight >= 0.75
+        guard chosen.distinct >= 2 || chosen.weight >= 0.7 || longEnough else { return nil }
+        // 几何复核：按这个偏移，落在片段已覆盖范围内的其他气泡必须能在对应位置找到同一条消息。
+        // 格式化、相似度高的不同消息会给出看似一致的错误偏移，这里拦下。
+        // 被画中画压住、或位置上本来没有记录的气泡不作为冲突证据。
+        let result = check(bubbles, in: segment, offset: chosen.center, occluders: occluders)
+        guard result.agree >= 1, result.conflict <= max(0, result.agree / 3) else { return nil }
         return chosen.center
     }
 
-    private func verify(_ bubbles: [ChatBubble], in segment: TranscriptSegment, offset: CGFloat) -> Bool {
-        var agree = 0, conflict = 0
+    /// 复核结果。`unresolved` 是被画中画压住、或位置上本来就没有记录的气泡——都不算冲突。
+    private struct CheckResult {
+        var agree = 0
+        var conflict = 0
+        var unresolved = 0
+    }
+
+    private func check(
+        _ bubbles: [ChatBubble], in segment: TranscriptSegment, offset: CGFloat, occluders: [CGRect]
+    ) -> CheckResult {
+        var result = CheckResult()
         for bubble in bubbles where !bubble.clipped && bubble.kind == .message {
             let top = bubble.rect.minY + offset, bottom = bubble.rect.maxY + offset
             guard top >= segment.coveredTop + 4, bottom <= segment.coveredBottom - 4 else { continue }
             let normalized = TextMatch.normalize(bubble.text)
             let tolerance = max(14, 0.9 * bubble.rect.height)
-            let atPosition = segment.entries.filter { abs($0.top - top) < tolerance && !$0.clipped && $0.kind == .message }
-            if atPosition.contains(where: { TextMatch.similarity($0.normalized, normalized) >= 0.9 }) {
-                agree += 1
+            let samePosition = segment.entries.filter {
+                $0.kind == .message && !$0.clipped && abs($0.top - top) < tolerance
+            }
+            if samePosition.contains(where: { TextMatch.similarity($0.normalized, normalized) >= 0.7 }) {
+                result.agree += 1
+            } else if samePosition.isEmpty || occluders.contains(where: { $0.intersects(bubble.rect) }) {
+                result.unresolved += 1
             } else {
-                conflict += 1
+                result.conflict += 1
             }
         }
-        return agree >= 1 && conflict <= agree / 3
+        return result
+    }
+
+    /// 给定偏移下这一屏和片段是否明显矛盾（画面位移估计的兜底校验）。
+    private func contradicts(
+        _ frame: ParsedChatFrame, segment: TranscriptSegment, offset: CGFloat
+    ) -> Bool {
+        let result = check(frame.messageBubbles, in: segment, offset: offset, occluders: frame.occluders)
+        return result.agree == 0 && result.conflict > 0
     }
 
     /// 用气泡文字区域内的像素在文字估计附近 ±8 像素微调，让长截图接缝更准。
     /// 只比对气泡内部：聊天背景固定不动，整行比对会被背景拉偏。
     private func refine(
         _ offset: CGFloat, frame: ParsedChatFrame, bitmap: FrameBitmap,
-        previous: (segmentID: UUID, offset: CGFloat, bitmap: FrameBitmap, top: CGFloat, bottom: CGFloat)
+        previous: Last
     ) -> CGFloat {
         guard previous.bitmap.width == bitmap.width, previous.bitmap.height == bitmap.height else { return offset }
         let base = offset - previous.offset   // 帧坐标 y → 上一帧坐标 y + base... 即 prevY = y + base
@@ -287,9 +440,13 @@ nonisolated final class ChatStitcher {
         return previous.offset + base.rounded() + CGFloat(best - 8)
     }
 
-    private func bestOtherSegment(_ bubbles: [ChatBubble], excluding: UUID?) -> (Int, CGFloat)? {
+    private func bestOtherSegment(
+        _ bubbles: [ChatBubble], excluding: UUID?, occluders: [CGRect] = []
+    ) -> (Int, CGFloat)? {
         for (index, segment) in segments.enumerated().reversed() where segment.id != excluding {
-            if let offset = estimateOffset(bubbles, into: segment, hint: nil) { return (index, offset) }
+            if let offset = estimateOffset(bubbles, into: segment, hint: nil, occluders: occluders) {
+                return (index, offset)
+            }
         }
         return nil
     }
@@ -297,11 +454,14 @@ nonisolated final class ChatStitcher {
     // MARK: - 合并
 
     /// 把这一屏的气泡合入片段。返回片段内容是否变化（新消息、文字修正或删除幽灵条目）。
-    private func merge(_ frame: ParsedChatFrame, offset: CGFloat, into index: Int) -> Bool {
+    /// - Parameter textBacked: 这一帧的位置由文字证据给出（碎片小字不会混进来），
+    ///   新建的消息可以直接信任；否则要靠后续帧在同位置再次看到才确认。
+    private func merge(_ frame: ParsedChatFrame, offset: CGFloat, into index: Int, textBacked: Bool) -> Bool {
         var segment = segments[index]
         var changed = false
         var matched = Set<UUID>()
         let viewTop = frame.contentTop + offset, viewBottom = frame.contentBottom + offset
+        // 这一屏的文字证据是否足够。只有文字印证过的消息才进对话列表（整屏图片时尤其重要）。
 
         for bubble in frame.bubbles {
             let normalized = TextMatch.normalize(bubble.text)
@@ -366,6 +526,11 @@ nonisolated final class ChatStitcher {
                 entry.minX = bubble.rect.minX; entry.maxX = bubble.rect.maxX
                 if entry.senderName == nil { entry.senderName = bubble.senderName }
                 if entry.text != before || entry.quote != beforeQuote { changed = true }
+                // 和已有条目在同位置对上了文字，这条就是真的。
+                if !entry.textConfirmed, !entry.clipped || textBacked {
+                    entry.textConfirmed = true
+                    changed = true
+                }
                 segment.entries[i] = entry
                 matched.insert(entry.id)
             } else {
@@ -375,6 +540,7 @@ nonisolated final class ChatStitcher {
                     top: top, bottom: bottom, minX: bubble.rect.minX, maxX: bubble.rect.maxX,
                     clippedTop: bubble.clippedTop, clippedBottom: bubble.clippedBottom,
                     senderName: bubble.senderName, quote: bubble.quote,
+                    textConfirmed: !bubble.clipped && textBacked,
                     observations: 1, misses: 0, firstSeen: frame.capturedAt, lastSeen: frame.capturedAt
                 )
                 segment.entries.append(entry)
@@ -459,8 +625,13 @@ nonisolated final class ChatStitcher {
             targetSegment.coveredBottom = max(targetSegment.coveredBottom, other.coveredBottom + shift)
             if let i = segments.firstIndex(where: { $0.id == target }) { segments[i] = targetSegment }
             segments.removeAll { $0.id == other.id }
+            if let position = chain.firstIndex(of: other.id) {
+                if chain.contains(target) { chain.remove(at: position) }
+                else { chain[position] = target }
+            }
             merged.append((other.id, shift))
         }
+        refreshLiveFlags()
         return merged
     }
 }

@@ -26,9 +26,8 @@ final class LiveChatCoordinator {
     private var currentSession: UUID?
     private var observers: [UUID: () -> Void] = [:]
 
-    private let pipStatusLabel = UILabel()
-    private let pipDetailLabel = UILabel()
-    private lazy var pipView: UIView = makePiPView()
+    private let pipView = JarvisPiPView()
+    private let publisher = ReplyBundlePublisher()
 
     private init() {
         scheduler.onChange = { [weak self] in self?.notify() }
@@ -163,45 +162,73 @@ final class LiveChatCoordinator {
     }
 
     private func notify() {
+        publisher.refresh(latest: latest, scheduler: scheduler, capturing: captureState == .broadcasting)
         updatePiP()
         for handler in observers.values { handler() }
     }
 
-    private func updatePiP() {
-        pipStatusLabel.text = "Jarvis · \(statusLine)"
-        if let outcome = scheduler.outcome, !outcome.stale, let best = outcome.replies?.first {
-            pipDetailLabel.text = "Jarvis 推荐：\(best.text)"
-        } else if let action = scheduler.outcome?.analysis?.bestAction, scheduler.outcome?.stale == false {
-            pipDetailLabel.text = "Jarvis 建议：\(action.choice)"
-        } else {
-            let line = analysisLine
-            pipDetailLabel.text = "Jarvis \(line.isEmpty ? "待命" : line)"
-        }
-    }
+    /// 候选已写给键盘、键盘可以插入。
+    var keyboardReady: Bool { publisher.isReady }
 
-    private func makePiPView() -> UIView {
-        let container = UIView()
-        container.backgroundColor = .white
-        pipStatusLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        pipDetailLabel.font = .systemFont(ofSize: 15)
-        for label in [pipStatusLabel, pipDetailLabel] {
-            label.textColor = .black
-            // 单行截断：换行会让画中画文字被 OCR 成不以标记开头的碎片。
-            label.numberOfLines = 1
-            label.lineBreakMode = .byTruncatingTail
+    /// 画中画三行：会话与危险程度 / Jev 判断 / 下一步（需要上下文时提示上滑）。
+    private func updatePiP() {
+        let latest = latest
+        let chatting = captureState == .broadcasting && latest?.detection == .chat
+        guard chatting, let latest else {
+            pipView.show(
+                status: "Jarvis · \(statusLine)",
+                judge: "Jarvis 打开一个聊天窗口，停留片刻即可识别",
+                action: "Jarvis 对方发来新消息时自动判断",
+                tone: .neutral
+            )
+            return
         }
-        pipStatusLabel.text = "Jarvis · 待命"
-        pipDetailLabel.text = "Jarvis 开始录屏后自动识别聊天页"
-        let stack = UIStackView(arrangedSubviews: [pipStatusLabel, pipDetailLabel])
-        stack.axis = .vertical
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
-        ])
-        return container
+        let name = latest.title ?? "当前会话"
+        let count = latest.liveMessages.filter { $0.kind == .message }.count
+        let outcome = scheduler.outcome
+        let analysis = outcome?.stale == false ? outcome?.analysis : nil
+
+        var status = "Jarvis · \(name) · \(count) 条"
+        var tone: JarvisPiPView.Tone = .neutral
+        if let danger = analysis?.dangerLevel {
+            let level = Int(danger.score.rounded())
+            status += " · 危险 \(level)/\(danger.maxLevel)"
+            let ratio = Double(level) / Double(max(danger.maxLevel, 1))
+            tone = ratio >= 0.7 ? .danger : (ratio >= 0.4 ? .warn : .calm)
+        }
+
+        let judge: String
+        if let analysis {
+            judge = "Jarvis 判断：\(JudgeLabels.summary(analysis))"
+        } else if outcome?.stale == true {
+            judge = "Jarvis 会话有新消息，之前的判断已过时"
+        } else if let error = outcome?.judgeError {
+            judge = "Jarvis 判断失败：\(error)"
+        } else {
+            judge = "Jarvis \(analysisLine.isEmpty ? "等待对方新消息" : analysisLine)"
+        }
+
+        let action: String
+        switch scheduler.contextNeed {
+        case .history:
+            action = "Jarvis ↑ 对方在问以前的事，上滑聊天记录找到那段再判断"
+            tone = .prompt
+        case .short(let have, let want):
+            action = "Jarvis ↑ 上下文只有 \(have) 条，上滑聊天记录补到 \(want) 条会更准"
+            tone = .prompt
+        case .none:
+            if scheduler.phase == .analyzing {
+                action = outcome?.isContextRefresh == true ? "Jarvis 已补充上下文，重新判断中…" : "Jarvis 正在判断…"
+            } else if publisher.isReady {
+                action = "Jarvis 候选已就绪 · 点输入框切到 Jarvis 键盘"
+            } else if analysis != nil, outcome?.replies == nil, outcome?.replyError == nil {
+                action = "Jarvis 候选回复生成中…"
+            } else if let error = outcome?.replyError {
+                action = "Jarvis \(error)"
+            } else {
+                action = "Jarvis \(analysisLine.isEmpty ? "等待对方新消息" : analysisLine)"
+            }
+        }
+        pipView.show(status: status, judge: judge, action: action, tone: tone)
     }
 }

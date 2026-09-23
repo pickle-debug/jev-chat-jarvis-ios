@@ -21,11 +21,14 @@ nonisolated struct ChatLayoutParser {
         bitmap: FrameBitmap,
         frameID: UUID,
         capturedAt: Date,
-        anchors: LayoutAnchors
+        anchors: LayoutAnchors,
+        jarvisKeyboardTop: CGFloat? = nil,
+        occluders: [CGRect] = []
     ) -> ParsedChatFrame {
         let W = CGFloat(bitmap.width), H = CGFloat(bitmap.height)
         var headerBottom: CGFloat = 0.1 * H
         var titleAnchored = false
+        var bodyLineHeight: CGFloat = 0
 
         func result(
             score: Double, title: String?, top: CGFloat, bottom: CGFloat,
@@ -36,7 +39,7 @@ nonisolated struct ChatLayoutParser {
                 chatScore: max(0, min(1, score)), isChat: reason == nil,
                 title: title, titleAnchored: titleAnchored, contentTop: top, contentBottom: bottom,
                 headerBottom: min(top, headerBottom), bubbles: bubbles, keyboardVisible: keyboard,
-                rejectReason: reason
+                bodyLineHeight: bodyLineHeight, occluders: occluders, rejectReason: reason
             )
         }
 
@@ -69,7 +72,8 @@ nonisolated struct ChatLayoutParser {
             contentTop = max(learned, overlayBottom.map { $0 + 0.025 * H } ?? learned)
         }
 
-        let keyboardTop = Self.detectKeyboardTop(lines, W: W, H: H)
+        // Jarvis 键盘没有单字按键，靠它顶部的 “Jarvis 键盘” 标记定位；两者取更靠上的。
+        let keyboardTop = [Self.detectKeyboardTop(lines, W: W, H: H), jarvisKeyboardTop].compactMap { $0 }.min()
 
         // 页面背景色只作“气泡是否彩色”的弱参考；照片壁纸下它不代表输入栏或气泡外的颜色。
         let midRegion = CGRect(x: 0.03 * W, y: 0.25 * H, width: 0.94 * W, height: 0.4 * H)
@@ -82,7 +86,11 @@ nonisolated struct ChatLayoutParser {
             bottomDetected = true
         }
         if let keyboardTop {
-            contentBottom = min(contentBottom, keyboardTop - (bottomDetected ? 0.06 : 0.12) * H)
+            // 键盘上方还有输入栏（微信约 50pt，扣掉气泡与输入栏的间距后 ≈ 0.045H）和系统键盘的候选栏。
+            // Jarvis 键盘自带标记且没有候选栏，只需再让出输入栏高度。
+            let fromJarvis = jarvisKeyboardTop.map { abs($0 - keyboardTop) < 1 } ?? false
+            let margin: CGFloat = fromJarvis ? 0.045 : (bottomDetected ? 0.06 : 0.12)
+            contentBottom = min(contentBottom, keyboardTop - margin * H)
         }
         guard contentBottom > contentTop + 0.2 * H else {
             return result(score: 0, title: title, top: contentTop, bottom: contentBottom, bubbles: [],
@@ -92,16 +100,22 @@ nonisolated struct ChatLayoutParser {
         let zoneLines = lines.filter { $0.rect.midY > contentTop && $0.rect.midY < contentBottom }
         let edgeCount = zoneLines.filter { $0.rect.minX < 0.06 * W || $0.rect.maxX > 0.94 * W }.count
         let edgeRatio = zoneLines.isEmpty ? 1 : Double(edgeCount) / Double(zoneLines.count)
-        // 正文行高：取偏上分位，避免图片小字、引用小字把基准拉低。
+        // 正文行高：优先用本会话学到的值（把整屏图片里的小字挡在外面），
+        // 学到之前取偏上分位，避免图片小字、引用小字把基准拉低。
         let heights = zoneLines.map(\.rect.height).sorted()
-        let bodyHeight = heights.isEmpty ? 0 : heights[min(heights.count - 1, heights.count * 7 / 10)]
+        let estimated = heights.isEmpty ? 0 : heights[min(heights.count - 1, heights.count * 7 / 10)]
+        if let learned = anchors.bodyHeight, estimated > 0, abs(learned - estimated) <= 0.3 * learned {
+            bodyLineHeight = learned
+        } else {
+            bodyLineHeight = estimated
+        }
 
         var contentLines: [OCRLine] = []
         var timeBubbles: [ChatBubble] = []
         for line in zoneLines {
             let text = line.text.trimmingCharacters(in: .whitespaces)
             // 图片、截图、表情里的小字不是聊天消息。
-            if zoneLines.count >= 3 && line.rect.height < 0.62 * bodyHeight { continue }
+            if zoneLines.count >= 3 && line.rect.height < 0.62 * bodyLineHeight { continue }
             let centered = abs(line.rect.midX - W / 2) < 0.06 * W
                 && abs(line.rect.minX - (W - line.rect.maxX)) < 0.1 * W
             if Self.isTimestamp(text) {
@@ -114,7 +128,7 @@ nonisolated struct ChatLayoutParser {
                 continue
             }
             if Self.isChrome(text) || Self.isSystemNotice(text) { continue }
-            let small = zoneLines.count >= 3 ? line.rect.height < 0.85 * bodyHeight : line.rect.width < 0.45 * W
+            let small = zoneLines.count >= 3 ? line.rect.height < 0.85 * bodyLineHeight : line.rect.width < 0.45 * W
             if centered && small && line.rect.width < 0.6 * W { continue }
             contentLines.append(line)
         }
@@ -144,7 +158,7 @@ nonisolated struct ChatLayoutParser {
             while parent >= 0 && skip.contains(parent) { parent -= 1 }
             // 本屏最上面的“名字：”块：它引用的那条消息已滚出屏幕，丢弃（下一帧会连同上方消息一起看到）。
             if parent < 0 { skip.insert(i); continue }
-            guard let above = groups[parent].last, group[0].rect.minY - above.rect.maxY < 2.3 * bodyHeight else { continue }
+            guard let above = groups[parent].last, group[0].rect.minY - above.rect.maxY < 2.3 * bodyLineHeight else { continue }
             skip.insert(i)
             let text = Self.join(group.map(\.text))
             quoteFor[parent] = quoteFor[parent].map { $0 + " " + text } ?? text
@@ -172,13 +186,19 @@ nonisolated struct ChatLayoutParser {
             let rect = group.dropFirst().reduce(group[0].rect) { $0.union($1.rect) }
             let text = Self.cleanBubbleText(Self.join(group.map(\.text)))
             guard !text.isEmpty else { continue }
+            // 聊天正文的字号是固定的一档：每个字约占 0.6 个行高。字数远超这个密度，说明是
+            // 图片、截图里的小字被当成一行识别出来了（像素对齐的少量噪声会让它们偶尔整段露出来）。
             let lineHeight = group.map(\.rect.height).min() ?? rect.height
+            // 聊天正文是固定一档字号。明显更小的一行来自图片/截图里的字，不是消息。
+            if let learned = anchors.bodyHeight, lineHeight < 0.72 * learned { continue }
             let color = Self.bubbleColor(rect: rect, lineHeight: lineHeight, bitmap: bitmap)
             let (side, confidence) = Self.classifySide(rect: rect, color: color, page: pageColor, anchors: anchors, W: W)
+            // Jarvis 画中画压住的气泡：按“显示不完整”处理，别让残缺文字进入对话列表。
+            let occluded = occluders.contains { $0.intersects(rect.insetBy(dx: -2, dy: -2)) }
             bubbles.append(ChatBubble(
                 kind: .message, text: text, rect: rect, side: side, sideConfidence: confidence,
-                clippedTop: rect.minY < contentTop + 0.8 * lineHeight,
-                clippedBottom: rect.maxY > contentBottom - 0.5 * lineHeight,
+                clippedTop: occluded || rect.minY < contentTop + 0.8 * lineHeight,
+                clippedBottom: occluded || rect.maxY > contentBottom - 0.5 * lineHeight,
                 senderName: senderNames[index], quote: quoteFor[index], color: color
             ))
         }

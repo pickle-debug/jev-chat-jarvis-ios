@@ -33,6 +33,15 @@ final class LiveAnalysisScheduler {
         case skipped(String)
     }
 
+    /// 这一次判断是否需要更多上下文。画中画据此提示用户上滑聊天记录。
+    enum ContextNeed: Equatable {
+        case none
+        /// 分析时实时段里的消息少于设置的上下文条数。
+        case short(have: Int, want: Int)
+        /// Jev 判断需要先查历史（对方在考你是否记得某件事）。
+        case history
+    }
+
     struct Outcome {
         let conversationID: UUID
         let revision: Int
@@ -46,11 +55,22 @@ final class LiveAnalysisScheduler {
         var replyError: String?
         /// 会话在分析之后又有新内容。
         var stale = false
+        /// 本次分析实际发给模型的消息条数，以及其中最早一条的 ID（用来判断用户是否上滑补了更早的记录）。
+        var analyzedCount = 0
+        var analyzedFirstID: UUID?
+        /// 这是用户上滑补充上下文后的重新分析。
+        var isContextRefresh = false
     }
 
     static let debounce: Duration = .milliseconds(800)
     static let signatureDepth = 6
     static let autoRunsPerMinute = 6
+    /// 用户停止上滑多久后，用补充的上下文重新分析。
+    static let contextSettle: Duration = .milliseconds(1500)
+    /// 同一条最新消息最多因为补充上下文重新分析几次，防止“一直要求查历史”变成持续计费。
+    static let maxContextRefreshes = 2
+    /// 需要查历史时，一次最多带多少条消息。
+    static let historyContextLimit = 50
 
     private let config: JarvisConfig
     private let judgeClient: JudgeClient
@@ -67,6 +87,9 @@ final class LiveAnalysisScheduler {
     private var analysisTask: Task<Void, Never>?
     private var currentRequestID: UUID?
     private var autoRunTimes: [Date] = []
+    private var contextTask: Task<Void, Never>?
+    private var contextRefreshes = 0
+    private var pendingOlder = 0
 
     init() {
         let config = JarvisConfig.shared
@@ -104,7 +127,11 @@ final class LiveAnalysisScheduler {
         let messages = engine.liveMessages.filter { $0.kind == .message }
         guard let newest = messages.last else { return }
         let signature = Self.signature(of: messages)
-        if signature == handledSignature { return }
+        if signature == handledSignature {
+            considerContextRefresh(engine)
+            return
+        }
+        contextRefreshes = 0
 
         if var current = outcome, current.signature != signature, !current.stale {
             current.stale = true
@@ -142,7 +169,7 @@ final class LiveAnalysisScheduler {
             // 防抖期间内容又变了，交给下一次 update 处理。
             guard let latest = self.latest, Self.signature(of: latest.liveMessages) == signature else { return }
             self.autoRunTimes.append(Date())
-            self.run(latest, signature: signature)
+            self.run(latest, signature: signature, limit: self.config.contextMessageCount)
         }
     }
 
@@ -155,11 +182,62 @@ final class LiveAnalysisScheduler {
         let signature = Self.signature(of: latest.liveMessages)
         handledSignature = signature
         cancelAll()
-        run(latest, signature: signature)
+        let limit = outcome?.analysis?.bestAction?.choice == "check_history"
+            ? Self.historyContextLimit : config.contextMessageCount
+        run(latest, signature: signature, limit: limit)
+    }
+
+    /// 当前结论是否需要更多上下文。
+    var contextNeed: ContextNeed {
+        guard let outcome, !outcome.stale, phase == .ready || phase == .analyzing else { return .none }
+        if outcome.analysis?.bestAction?.choice == "check_history", contextRefreshes < Self.maxContextRefreshes {
+            return .history
+        }
+        let want = config.contextMessageCount
+        if outcome.analyzedCount > 0, outcome.analyzedCount < want, contextRefreshes < Self.maxContextRefreshes {
+            return .short(have: outcome.analyzedCount, want: want)
+        }
+        return .none
+    }
+
+    /// 用户按提示上滑、长图顶部补进了更早的消息：停下来 1.5 秒后，用补充的上下文重新分析同一条最新消息。
+    private func considerContextRefresh(_ engine: EngineUpdate) {
+        guard phase == .ready, let current = outcome, !current.stale,
+              let firstID = current.analyzedFirstID else { return }
+        let need = contextNeed
+        guard need != .none else { return }
+        let messages = engine.liveMessages.filter { $0.kind == .message }
+        guard let firstIndex = messages.firstIndex(where: { $0.id == firstID }) else { return }
+        let older = firstIndex
+        let enough: Bool
+        switch need {
+        case .none: enough = false
+        case .short(let have, let want): enough = have + older >= want
+        case .history: enough = older >= 3
+        }
+        guard older > 0, older != pendingOlder || contextTask == nil else { return }
+        pendingOlder = older
+        contextTask?.cancel()
+        contextTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.contextSettle)
+            guard !Task.isCancelled, let self, let latest = self.latest,
+                  latest.conversationID == current.conversationID,
+                  Self.signature(of: latest.liveMessages) == current.signature else { return }
+            let nowOlder = latest.liveMessages.filter { $0.kind == .message }.firstIndex { $0.id == firstID } ?? 0
+            // 仍在继续上滑就再等；够了或者停住了都用现有内容重新分析。
+            guard nowOlder == older || enough else { return }
+            self.contextTask = nil
+            self.pendingOlder = 0
+            self.contextRefreshes += 1
+            let limit = need == .history
+                ? Self.historyContextLimit : self.config.contextMessageCount
+            self.run(latest, signature: current.signature, limit: limit, contextRefresh: true)
+        }
     }
 
     func reset() {
         cancelAll()
+        contextRefreshes = 0
         conversationID = nil
         latest = nil
         outcome = nil
@@ -176,17 +254,23 @@ final class LiveAnalysisScheduler {
 
     // MARK: - 执行
 
-    private func run(_ engine: EngineUpdate, signature: String) {
+    private func run(_ engine: EngineUpdate, signature: String, limit: Int, contextRefresh: Bool = false) {
         guard let conversationID = engine.conversationID else { return }
+        analysisTask?.cancel()
         let requestID = UUID()
         currentRequestID = requestID
-        outcome = Outcome(
+        var snapshot = Self.snapshot(from: engine.liveMessages)
+        snapshot.contextLimit = limit
+        let sent = engine.liveMessages.filter { $0.kind == .message }.suffix(max(1, limit))
+        var next = Outcome(
             conversationID: conversationID, revision: engine.revision, signature: signature,
             requestID: requestID, startedAt: Date()
         )
+        next.analyzedCount = sent.count
+        next.analyzedFirstID = sent.first?.id
+        next.isContextRefresh = contextRefresh
+        outcome = next
         setPhase(.analyzing)
-        var snapshot = Self.snapshot(from: engine.liveMessages)
-        snapshot.contextLimit = config.contextMessageCount
         let relationship = config.relationship
 
         analysisTask = Task { [weak self] in
@@ -253,6 +337,9 @@ final class LiveAnalysisScheduler {
     private func cancelAll() {
         debounceTask?.cancel()
         debounceTask = nil
+        contextTask?.cancel()
+        contextTask = nil
+        pendingOlder = 0
         analysisTask?.cancel()
         analysisTask = nil
         currentRequestID = nil
