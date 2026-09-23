@@ -83,6 +83,32 @@ final class JarvisConfig {
         set { defaults.setTrimmed(newValue, forKey: Keys.relationship) }
     }
 
+    // MARK: - 长截图与上下文
+
+    /// 长截图保留的不重复画面张数。越多越占内存（每张约 100 KB JPEG），导出的长图越长。
+    var ladderCapacity: Int {
+        get { Self.clamp(defaults.object(forKey: Keys.ladderCapacity) as? Int, Defaults.ladderCapacity, Defaults.ladderCapacityRange) }
+        set {
+            defaults.set(Self.clamp(newValue, Defaults.ladderCapacity, Defaults.ladderCapacityRange), forKey: Keys.ladderCapacity)
+            NotificationCenter.default.post(name: JarvisConfig.liveSettingsDidChange, object: self)
+        }
+    }
+
+    /// 每次分析发给模型的最近聊天条数（不含时间分隔线）。越多上下文越完整，token 消耗也越多。
+    var contextMessageCount: Int {
+        get { Self.clamp(defaults.object(forKey: Keys.contextMessageCount) as? Int, Defaults.contextMessageCount, Defaults.contextMessageRange) }
+        set {
+            defaults.set(Self.clamp(newValue, Defaults.contextMessageCount, Defaults.contextMessageRange), forKey: Keys.contextMessageCount)
+            NotificationCenter.default.post(name: JarvisConfig.liveSettingsDidChange, object: self)
+        }
+    }
+
+    static let liveSettingsDidChange = Notification.Name("jarvis.liveSettingsDidChange")
+
+    private static func clamp(_ value: Int?, _ fallback: Int, _ range: ClosedRange<Int>) -> Int {
+        min(max(value ?? fallback, range.lowerBound), range.upperBound)
+    }
+
     // MARK: - 组合读取
 
     func endpoint(for route: APIRoute) -> String {
@@ -126,6 +152,8 @@ final class JarvisConfig {
         static let visionBaseURL = "jarvis.vision.baseURL"
         static let visionModel = "jarvis.vision.model"
         static let relationship = "jarvis.relationship"
+        static let ladderCapacity = "jarvis.live.ladderCapacity"
+        static let contextMessageCount = "jarvis.live.contextMessageCount"
     }
 
     enum Defaults {
@@ -134,6 +162,10 @@ final class JarvisConfig {
         static let visionBaseURL = "https://openrouter.ai/api/v1"
         static let visionModel = "qwen/qwen2.5-vl-72b-instruct"
         static let relationship = "对方是我的伴侣；from=me 的是我发的，from=other 的是对方发的"
+        nonisolated static let ladderCapacity = 10
+        nonisolated static let ladderCapacityRange = 3...30
+        nonisolated static let contextMessageCount = 10
+        nonisolated static let contextMessageRange = 4...50
     }
 }
 

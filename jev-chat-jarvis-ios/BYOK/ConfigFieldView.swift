@@ -70,3 +70,66 @@ func makeFootnoteLabel(_ text: String) -> UILabel {
     label.adjustsFontForContentSizeCategory = true
     return label
 }
+
+/// “标题 + 当前值 + 步进器”的数值配置行，附一行随数值变化的说明。
+final class StepperRowView: UIView {
+    let stepper = UIStepper()
+    private let titleLabel = UILabel()
+    private let valueLabel = UILabel()
+    private let noteLabel = makeFootnoteLabel("")
+    private let format: (Int) -> String
+    private let note: (Int) -> String
+    var onChange: ((Int) -> Void)?
+
+    init(title: String, range: ClosedRange<Int>, step: Int = 1,
+         format: @escaping (Int) -> String, note: @escaping (Int) -> String) {
+        self.format = format
+        self.note = note
+        super.init(frame: .zero)
+        titleLabel.text = title
+        titleLabel.font = .preferredFont(forTextStyle: .body)
+        titleLabel.adjustsFontForContentSizeCategory = true
+        titleLabel.numberOfLines = 0
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize, weight: .semibold)
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+        stepper.minimumValue = Double(range.lowerBound)
+        stepper.maximumValue = Double(range.upperBound)
+        stepper.stepValue = Double(step)
+        stepper.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            refresh()
+            onChange?(value)
+        }, for: .valueChanged)
+
+        let row = UIStackView(arrangedSubviews: [titleLabel, valueLabel, stepper])
+        row.alignment = .center
+        row.spacing = 12
+        let stack = UIStackView(arrangedSubviews: [row, noteLabel])
+        stack.axis = .vertical
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor)
+        ])
+        accessibilityElements = [stepper, noteLabel]
+        stepper.accessibilityLabel = title
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    var value: Int {
+        get { Int(stepper.value) }
+        set { stepper.value = Double(newValue); refresh() }
+    }
+
+    private func refresh() {
+        valueLabel.text = format(value)
+        noteLabel.text = note(value)
+        stepper.accessibilityValue = format(value)
+    }
+}

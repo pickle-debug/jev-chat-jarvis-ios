@@ -30,6 +30,16 @@ final class SettingsViewController: UIViewController {
     private let visionFields = UIStackView()
 
     private let relationshipField = ConfigFieldView(title: "关系描述", placeholder: JarvisConfig.Defaults.relationship)
+    private let contextRow = StepperRowView(
+        title: "分析上下文条数", range: JarvisConfig.Defaults.contextMessageRange,
+        format: { "\($0) 条" },
+        note: { "每次分析把长图里最新的 \($0) 条聊天（不含时间分隔线）发给判断和回复模型。条数越多理解越完整，token 消耗也越多。" }
+    )
+    private let ladderRow = StepperRowView(
+        title: "长截图保留张数", range: JarvisConfig.Defaults.ladderCapacityRange,
+        format: { "\($0) 张" },
+        note: { "实时拼接时保留最近 \($0) 张不重复的画面，超出后最早的一端移出长图（文字记录仍保留）。每张约 100 KB，只存在内存里。" }
+    )
 
     private var runningTests = Set<APIRoute>()
 
@@ -64,6 +74,8 @@ final class SettingsViewController: UIViewController {
         visionModel.text = config.visionModel
         visionKey.text = config.secrets.key(for: .vision)
         relationshipField.text = config.relationship
+        contextRow.value = config.contextMessageCount
+        ladderRow.value = config.ladderCapacity
         visionFields.isHidden = !config.visionEnabled
     }
 
@@ -79,6 +91,8 @@ final class SettingsViewController: UIViewController {
         config.visionModel = visionModel.text
         config.secrets.setKey(visionKey.text, for: .vision)
         config.relationship = relationshipField.text
+        if config.contextMessageCount != contextRow.value { config.contextMessageCount = contextRow.value }
+        if config.ladderCapacity != ladderRow.value { config.ladderCapacity = ladderRow.value }
     }
 
     private func refreshEndpointLabels() {
@@ -228,6 +242,11 @@ final class SettingsViewController: UIViewController {
 
             makeSectionLabel("分析上下文"),
             relationshipField,
+            contextRow,
+
+            makeSectionLabel("长截图"),
+            ladderRow,
+
             makeFootnoteLabel("三路凭据互相独立，某一路留空不会去借用另一路的密钥。密钥保存在本机 UserDefaults，会随设备备份导出。")
         ])
         stack.axis = .vertical
@@ -235,6 +254,8 @@ final class SettingsViewController: UIViewController {
         stack.setCustomSpacing(24, after: replyStatus)
         stack.setCustomSpacing(24, after: judgeStatus)
         stack.setCustomSpacing(24, after: visionFields)
+        stack.setCustomSpacing(24, after: contextRow)
+        stack.setCustomSpacing(24, after: ladderRow)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let scrollView = UIScrollView()

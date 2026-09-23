@@ -15,10 +15,11 @@ struct ChatMessage {
 /// 一次分析的输入。首版来自用户手动粘贴，后续接 OCR 会话层。
 struct ChatSnapshot {
     let messages: [ChatMessage]
+    /// 发给模型的最近消息条数（判断、生成、排序共用）。默认 10 条，和安卓参考实现一致；可在设置里调整。
+    var contextLimit: Int = JarvisConfig.Defaults.contextMessageCount
 
-    /// 发给模型的只取最近 10 条，和安卓参考实现一致。
     var recentMessages: [ChatMessage] {
-        Array(messages.suffix(10))
+        Array(messages.suffix(max(1, contextLimit)))
     }
 }
 

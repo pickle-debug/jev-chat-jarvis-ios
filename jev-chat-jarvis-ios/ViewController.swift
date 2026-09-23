@@ -10,24 +10,36 @@ final class ViewController: UIViewController {
     private let pipButton = UIButton(configuration: .tinted())
     private let analysisButton = UIButton(configuration: .tinted())
     private let settingsButton = UIButton(configuration: .gray())
+    private let liveButton = UIButton(configuration: .filled())
+    private let liveStatusLabel = UILabel()
+    private let live = LiveChatCoordinator.shared
+    private var liveObserver: UUID?
     private var receivedFrames = 0
 
     override func viewDidLoad() {
         super.viewDidLoad()
         buildHome()
         configureCapture()
+        liveObserver = live.observe { [weak self] in self?.renderLiveStatus() }
+        renderLiveStatus()
+    }
+
+    private func renderLiveStatus() {
+        let analysis = live.analysisLine
+        liveStatusLabel.text = analysis.isEmpty ? live.statusLine : "\(live.statusLine)\n\(analysis)"
     }
 
     private func configureCapture() {
         do {
             let capture = try VisynCaptureController(
                 configuration: .load(),
-                pictureInPictureContent: makePiPContent()
+                pictureInPictureContent: live.makePiPContent()
             )
             self.capture = capture
             capture.onStateChange = { [weak self] state in
                 guard let self else { return }
                 recordButton.configuration?.title = state == .stopped ? "开始录屏" : "停止录屏"
+                live.captureStateChanged(state)
                 switch state {
                 case .broadcasting:
                     statusLabel.text = "正在采集屏幕"
@@ -43,6 +55,7 @@ final class ViewController: UIViewController {
                 guard let self else { return }
                 receivedFrames += 1
                 frameLabel.text = "已收到 \(receivedFrames) 帧 · \(frame.width) × \(frame.height)"
+                live.receive(frame)
             }
             capture.onPictureInPictureChange = { [weak self] active in
                 self?.pipButton.configuration?.title = active ? "关闭画中画" : "开启画中画"
@@ -96,6 +109,14 @@ final class ViewController: UIViewController {
             self?.errorLabel.isHidden = true
             self?.capture?.togglePictureInPicture()
         }, for: .touchUpInside)
+        liveButton.configuration?.title = "实时会话"
+        liveButton.configuration?.image = UIImage(systemName: "text.bubble")
+        liveButton.configuration?.baseBackgroundColor = .systemTeal
+        liveButton.addAction(UIAction { [weak self] _ in
+            self?.present(LiveSessionViewController())
+        }, for: .touchUpInside)
+        liveStatusLabel.font = .preferredFont(forTextStyle: .subheadline)
+        liveStatusLabel.textColor = .secondaryLabel
         analysisButton.configuration?.title = "手动分析"
         analysisButton.configuration?.image = UIImage(systemName: "sparkles")
         analysisButton.addAction(UIAction { [weak self] _ in
@@ -106,16 +127,17 @@ final class ViewController: UIViewController {
         settingsButton.addAction(UIAction { [weak self] _ in
             self?.present(SettingsViewController())
         }, for: .touchUpInside)
-        for button in [recordButton, pipButton, analysisButton, settingsButton] {
+        for button in [recordButton, pipButton, liveButton, analysisButton, settingsButton] {
             button.configuration?.imagePadding = 10
             button.configuration?.cornerStyle = .large
             button.configuration?.contentInsets = .init(top: 16, leading: 20, bottom: 16, trailing: 20)
         }
         let hintLabel = UILabel()
-        hintLabel.text = "录屏的开始与停止都需要在系统面板中确认。画中画可在切换 App 后继续显示。"
+        hintLabel.text = "录屏的开始与停止都需要在系统面板中确认。录屏期间打开聊天窗口，Jarvis 会在本机识别文字、"
+            + "随滚动自动拼接长截图，并在对方发来新消息时调用判断接口分析。画中画可在切换 App 后继续显示。"
         hintLabel.font = .preferredFont(forTextStyle: .footnote)
         hintLabel.textColor = .secondaryLabel
-        for label in [titleLabel, subtitleLabel, statusLabel, frameLabel, errorLabel, hintLabel] {
+        for label in [titleLabel, subtitleLabel, statusLabel, frameLabel, liveStatusLabel, errorLabel, hintLabel] {
             label.numberOfLines = 0
             label.adjustsFontForContentSizeCategory = true
         }
@@ -124,15 +146,16 @@ final class ViewController: UIViewController {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
         let stack = UIStackView(arrangedSubviews: [
-            titleLabel, subtitleLabel, statusLabel, frameLabel,
-            errorLabel, recordButton, pipButton, analysisButton, settingsButton, hintLabel
+            titleLabel, subtitleLabel, statusLabel, frameLabel, liveStatusLabel,
+            errorLabel, recordButton, pipButton, liveButton, analysisButton, settingsButton, hintLabel
         ])
         stack.axis = .vertical
         stack.spacing = 16
         stack.setCustomSpacing(8, after: titleLabel)
         stack.setCustomSpacing(36, after: subtitleLabel)
         stack.setCustomSpacing(8, after: statusLabel)
-        stack.setCustomSpacing(28, after: frameLabel)
+        stack.setCustomSpacing(8, after: frameLabel)
+        stack.setCustomSpacing(28, after: liveStatusLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -146,16 +169,6 @@ final class ViewController: UIViewController {
             stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -24),
             stack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -48)
         ])
-    }
-
-    private func makePiPContent() -> UIView {
-        let label = UILabel()
-        label.text = "测试中"
-        label.font = .systemFont(ofSize: 22, weight: .medium)
-        label.textAlignment = .center
-        label.textColor = .black
-        label.backgroundColor = .white
-        return label
     }
 
     /// 主页是 storyboard 里的裸 view controller，没有导航栈，

@@ -114,90 +114,16 @@ final class AnalysisViewController: UIViewController {
     // MARK: - 结果展示
 
     private func showJudge(_ analysis: Analysis) {
-        var lines: [String] = []
-        if let intent = analysis.trueIntent {
-            lines.append("真实意图：\(intent.choice)（置信度 \(Self.percent(intent.confidence))）")
-        }
-        if let needs = analysis.sheNeeds {
-            lines.append("对方需要：\(needs.choice)")
-        }
-        if let action = analysis.bestAction {
-            lines.append("最佳行动：\(action.choice)")
-        }
-        if let danger = analysis.dangerLevel {
-            lines.append("危险程度：\(Int(danger.score.rounded())) / \(danger.maxLevel)")
-        }
-        if let reply = analysis.shouldReplyNow {
-            lines.append("是否应给出实质内容：\(Self.percent(reply))")
-        }
-        if let tension = analysis.tensionResolved {
-            lines.append("张力已化解：\(Self.percent(tension))")
-        }
-        if let literal = analysis.literalQuestion {
-            lines.append("字面提问：\(Self.percent(literal))")
-        }
+        let lines = AnalysisPresentation.judgeLines(analysis)
         judgeResultLabel.text = lines.isEmpty ? "判断接口未返回可解析的结果" : lines.joined(separator: "\n")
         judgeResultLabel.isHidden = false
     }
 
-    /// 按文档 §8.1：从上到下推荐程度由低到高，最后一条最高。
     private func showCandidates(_ ranked: [RankedReply]) {
-        candidatesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let ascending = ranked.reversed()
-        for (index, reply) in ascending.enumerated() {
-            let isTop = index == ascending.count - 1
-            candidatesStack.addArrangedSubview(makeCandidateRow(
-                index: index,
-                reply: reply,
-                isTop: isTop
-            ))
+        AnalysisPresentation.fill(candidatesStack, with: ranked, unranked: false) { [weak self] _ in
+            self?.setStatus("已复制，可切回聊天 App 粘贴", isError: false)
         }
         candidatesStack.isHidden = false
-    }
-
-    private func makeCandidateRow(index: Int, reply: RankedReply, isTop: Bool) -> UIView {
-        let container = UIView()
-        container.backgroundColor = .secondarySystemBackground
-        container.layer.cornerRadius = 12
-
-        let marker = ["①", "②", "③"]
-        let textLabel = UILabel()
-        textLabel.text = "\(marker[min(index, 2)]) \(reply.text)"
-        textLabel.font = .preferredFont(forTextStyle: .body)
-        textLabel.numberOfLines = 0
-        textLabel.adjustsFontForContentSizeCategory = true
-
-        let noteLabel = makeFootnoteLabel(
-            isTop ? "优先推荐 · 推荐分 \(Self.percent(reply.probability))"
-                  : "推荐分 \(Self.percent(reply.probability))"
-        )
-
-        let copyButton = UIButton(configuration: .plain())
-        copyButton.configuration?.title = "复制"
-        copyButton.configuration?.contentInsets = .zero
-        // 按钮绑定候选文本本身，不用下标去读可能已经刷新的数组。
-        let text = reply.text
-        copyButton.addAction(UIAction { [weak self] _ in
-            UIPasteboard.general.string = text
-            self?.setStatus("已复制，可切回聊天 App 粘贴", isError: false)
-        }, for: .touchUpInside)
-
-        let bottomRow = UIStackView(arrangedSubviews: [noteLabel, UIView(), copyButton])
-        bottomRow.alignment = .center
-        bottomRow.spacing = 8
-
-        let stack = UIStackView(arrangedSubviews: [textLabel, bottomRow])
-        stack.axis = .vertical
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14)
-        ])
-        return container
     }
 
     private func clearResults() {
@@ -214,10 +140,6 @@ final class AnalysisViewController: UIViewController {
     private func setStatus(_ text: String, isError: Bool) {
         statusLabel.text = text
         statusLabel.textColor = isError ? .systemRed : .secondaryLabel
-    }
-
-    private static func percent(_ value: Double) -> String {
-        "\(Int((value * 100).rounded()))%"
     }
 
     // MARK: - 布局
