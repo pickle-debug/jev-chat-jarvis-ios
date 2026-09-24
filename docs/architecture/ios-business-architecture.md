@@ -6,7 +6,7 @@
 >
 > 适用范围：`jev-chat-jarvis-ios`、本地 `Visyn` Swift Package，以及安卓参考项目 `jev-chat-jarvis`
 >
-> 当前实现只包含屏幕采集演示和画中画演示。本文件描述接入 BYOK、OCR、跨屏会话合并、语义分析和 Jarvis 自定义键盘后的目标架构，不代表这些能力已经完成。
+> 本文同时保留原始设计基线和后续实现说明。BYOK、OCR、实时分析、画中画和键盘已有代码；2026-09-24 更新离线全拼键盘及候选状态链路，尚需按 `docs/keyboard-validation.md` 完成 Xcode/真机验收。
 
 ## 1. 目标与平台边界
 
@@ -21,7 +21,7 @@ Jarvis iOS 的目标是：用户在聊天 App 中阅读消息时，授权 Jarvis
 - 根据文字块、位置、时间和重叠关系合并连续屏幕中的聊天消息。
 - 使用三条独立的 BYOK 模型路线：Jev 判断、回复生成、可选的云视觉补充。
 - 使用 Visyn PiP 显示只读的摘要、状态和一条推荐结果。
-- 提供 Jarvis 自定义键盘，在键盘自身绘制三个候选按钮，点击后调用 `textDocumentProxy.insertText(_:)`。
+- 提供 Jarvis 自定义中文键盘，顶部横排三个回复候选，下方保留离线拼音、英文、数字和符号输入。
 
 ### 1.2 不可按安卓方式实现的能力
 
@@ -53,24 +53,25 @@ Jarvis iOS 的目标是：用户在聊天 App 中阅读消息时，授权 Jarvis
 flowchart LR
     U[用户授权与选择会话] --> C[ScreenCaptureProvider]
     C --> F[FramePipeline]
-    F --> O[VisionOCRService]
-    O --> P[ChatLayoutParser]
-    P --> A[ConversationAssembler]
-    A --> S[ConversationStore]
-    S --> J[JevJudgeClient]
-    S --> R[ReplyClient]
-    R --> Q[JevJudgeClient.rank]
-    J --> V[AnalysisStore]
-    Q --> V
-    V --> H[主 App 结果页]
-    V --> I[PiP 摘要]
-    V --> K[ReplyBundle 共享文件]
+    F --> O[ChatFrameRecognizer: 单屏 OCR]
+    O --> A[ChatSessionEngine: 当前文字和可用历史]
+    A --> S[ConversationContext: 纯文字输入]
+    A --> L[LongScreenshotStore: 独立图片存档]
+    S --> J[LiveAnalysisScheduler: Jev 判断]
+    S --> R[ReplySuggestionScheduler: 生成和排序]
+    J --> H[主 App 判断区]
+    J --> I[PiP 情绪与意图]
+    R --> K[ReplyBundlePublisher: 键盘共享文件]
     K --> W[Jarvis Keyboard Extension]
     W --> X[textDocumentProxy.insertText]
     X --> Y[用户检查并发送]
 ```
 
 ### 3.1 模块职责
+
+2026-09-24 业务拆分：`ChatFrameRecognizer` 负责 JPEG 解码、Vision、区域排除与版式；`ChatSessionEngine` 负责会话及文本历史匹配，输出当前屏可读消息和可用历史，裁切消息带提示直接进入纯文本上下文，不再被 `textConfirmed`/观察次数无限阻塞。图片的 `ChatLadder`、JPEG 编码和导出全部移入独立 `LongScreenshotStore` actor。协调器先分发文字，再提交有界图片单槽；图片可被更新帧替代，段合并的坐标迁移事件独立累计，不随图片丢弃。
+
+Jev 与回复候选分别维护状态和请求。Jev 完成直接更新 PiP，候选生成和排序完成直接发布键盘，两者不互等；只有同一次请求、同一上下文版本时才给候选附加判断摘要。实时会话页分别展示当前 OCR、长图存档、Jev、候选状态。下列旧架构名为职责参考，以当前具体类型为准。
 
 ```text
 CaptureSessionCoordinator
@@ -92,10 +93,10 @@ Storage
 Presentation
 ├── MainAppViewController            // 设置、状态、识别结果、复制
 ├── VisynPictureInPicturePresenter   // 只读摘要
-└── JarvisKeyboardViewController     // 三个自绘候选按钮和插入操作
+└── JarvisKeyboardViewController     // 三个回复候选、离线拼音和普通输入
 ```
 
-每层只处理一种责任。主 App 页面不直接调用 Vision 或模型网络；键盘扩展不读取屏幕帧、不持有 API Key、不执行 OCR。上述名称表示职责边界，不要求每项都创建独立框架或协议；判断与排序共用 `JevJudgeClient`，第一版不引入数据库、向量检索或完整拼音输入引擎。
+每层只处理一种责任。主 App 页面不直接调用 Vision 或模型网络；键盘扩展不读取屏幕帧、不持有 API Key、不执行 OCR。上述名称表示职责边界，不要求每项都创建独立框架或协议；判断与排序共用 `JevJudgeClient`，不引入数据库或向量检索。键盘的拼音选词使用随扩展打包的本地词库。
 
 当前 Visyn 的 PiP presenter 是库内部实现。第一阶段通过已有 controller 使用；为 ScreenCaptureKit 接入独立 PiP 时，再给 Visyn 增加公开呈现入口，不能直接调用其内部类型。
 
@@ -294,40 +295,43 @@ Jev 题目和 criteria 使用英文，聊天文字保持中文；每次发送的
 
 ### 7.3 分析调度
 
-实时路线的查询时机（`LiveAnalysisScheduler`，移植自安卓 `ChatCaptureService`）：实时段尾部最近 6 条消息（不含时间分隔线）的 `side:text` 签名去重——用户从下往上翻只在长图顶部补旧消息，尾部签名不变；仅当会话已两帧确认、最新一条被至少 2 帧看到（被裁切的需 4 帧）、且最新一条来自对方时自动触发；800ms 防抖；新签名取消在途请求，旧结论标记过期；Judge 与 Reply+Rank 并行；每分钟最多 6 次自动分析。自动分析开关默认开启，可在实时会话页关闭。
+实时路线（2026-09-24 更新）：单屏可读文字经 800ms 防抖即可分析，不要求上下文达到设定条数，也不要求最后一句来自对方。裁切只附“部分可见”说明，未知发言方保持 unknown，不作为无限等待条件。纯文本 `ConversationContext` 隔离 OCR/图片/观察次数；版本包含采集会话、聊天会话、尾部签名及实际输入窗口指纹。新尾部/会话取消旧请求，已有结果保留并标“上次结果”。Jev 判断和候选生成/排序分别完成、分别更新，不互相等待。普通自动分析和上下文补算共用每分钟 6 次额度。
 
 ```text
-ConversationSnapshot(revision N)
-   ├── Judge → 尽快显示判断结果
-   └── Reply → 生成 3 条 → Judge rank → 写入 ReplyBundle
+ConversationContext → AnalysisRequest（同一个文本窗口版本）
+   ├── Judge → 完成即更新 PiP 判断
+   └── Reply → 生成 3 条 → Rank → 完成即更新 ReplyBundle
+截图 → LongScreenshotStore（图片编码和导出独立，不参与上述完成条件）
 ```
 
 判断失败不应阻塞本地 OCR；回复生成失败时保留判断结果。排序失败时主 App 可以展示“未排序”候选，但不写成已从低到高排序的键盘结果。只有得到有效、非空且不同的三条候选，并完成有效排序，才发布键盘 ready 结果；不拼凑占位回复。
 
-首版由用户明确开始一次分析；自动分析作为可选设置，仅在高置信新消息和稳定会话下触发，并做防抖和去重。没有新消息不重复计费，用户浏览历史时不当作新来消息自动分析。
+自动分析默认开启，可在实时会话页关闭；关闭、停采、离开聊天页时取消排队与在途任务，暂停前的 OCR 回调另用采集 generation 拦截。用户补历史后停留 1.5 秒，按实际发送窗口指纹去重，同一尾部最多补算两次。跨段缺口作为明确标记保留给模型，不占真实消息额度。无重叠且方向不明的当前片段按独立单屏分析，不让旧历史链冒充当前内容。
 
 ## 8. Jarvis 自定义键盘
 
 ### 8.1 交互定位
 
-Jarvis 键盘是一个独立的 `UIInputViewController` 扩展，不是系统 QuickType 插件，也不是完整中文输入法。它的职责只有：
+Jarvis 键盘是独立的 `UIInputViewController` 中文键盘扩展，不是系统 QuickType 插件。2026-09-24 起将原来的建议面板改为可正常输入的键盘：
 
 1. 读取主 App 写入的最新候选结果。
-2. 在键盘顶部自绘三个候选按钮。
+2. 在键盘顶部横排三个回复候选；候选失效或分析失败时仍保留全部输入按键。
 3. 用户点击后调用 `textDocumentProxy.insertText(_:)`。
-4. 提供地球键切换回原来的输入法、收起键盘和必要的状态提示。
+4. 本地全拼与可滚动中文选词、英文大小写、数字、符号、删除/长按删除、空格、回车、地球键和收起键盘。
 
-“从低到高”暂按推荐分解释：三个完整句子从上到下排列，第一个最低，第三个最高并标记“优先推荐”；不把“风险低到高”混作推荐顺序。`rank=1/2/3` 表示展示次序，3 最高；同分时保留生成顺序，不宣称某条更好。排序含义应在 UI 文案中保持一致，不能把概率显示成“正确率”。
+`rank=1/2/3` 保持原共享契约，三个回复从左到右排列，3 为优先推荐并用底色区分。长回复在候选栏截断显示，插入的是完整文本。回复候选与本地拼音候选分开显示，避免中文输入时丢失回复或打字能力。
 
 ```text
-Jarvis · 来源会话：小王 · 刚刚更新
-① [第一条完整候选]             推荐程度较低
-② [第二条完整候选]
-③ [第三条完整候选]             优先推荐
-🌐 切换输入法       更新显示       收起
+Jarvis 键盘 · 小王       确认会话       收起
+[回复①]          [回复②]          [回复③]
+拼音/组合文本     [中文选词，可横向滚动]
+q w e r t y u i o p
+ a s d f g h j k l
+分词 z x c v b n m 删除
+123    🌐    中/英    空格    ，    回车
 ```
 
-设置、启用键盘和数据用途说明放主 App。键盘按 `needsInputModeSwitchKey` 决定是否提供自己的地球按钮，避免与系统重复；用户需要修改回复时切回原中文输入法，不在首版重造拼音引擎。
+键盘按 `needsInputModeSwitchKey` 决定是否提供地球按钮。中文使用全拼，`v` 输入 ü，分词键输入音节分隔符；空格选第一候选，回车先提交尚未选词的拼音原文。组合文本留在键盘内存，确认选词后才插入目标输入框。词库来自 Apache-2.0 的 Rime/Android Pinyin IME（65,125 条字词），许可和来源随扩展打包；不接入第三方运行时，也不保存或上传用户键入历史。当前不支持简拼、模糊音、自学习、语音输入和系统联想服务。
 
 ### 8.2 键盘扩展配置
 
@@ -382,7 +386,7 @@ App Group/
 键盘读取和按钮点击都要校验：
 
 - `schemaVersion` 是否支持。
-- `status=ready`、`sourceConfidence=confirmed`，且候选数量恰好为三条。
+- `status=ready`、`sourceConfidence=confirmed/recognized`，且候选数量恰好为三条。recognized 是单屏识别来源，键盘显示待核对提示；两种来源都必须人工确认后才可插入。
 - `expiresAt`（推荐的最大有效时间）和 `validUntil`（来源新鲜度）是否均有效。
 - 重新读取共享文件，确认 `sessionID + conversationID + revision + analysisRequestID + bundleID` 仍对应展示的候选。按钮绑定稳定的候选 ID 和文本，不用数组下标读取更新后的另一条候选。
 - 候选文字是否为空或超过键盘展示上限。
@@ -394,7 +398,7 @@ App Group/
 
 键盘出现、文本/选择变化、用户点击“更新显示”时重新读取；屏幕可见时可低频检查文件版本，离开后停止。显示旧候选期间还需安排本地过期处理，不能只在下次打开键盘时才检查。“更新显示”仅刷新缓存，不是调用模型。
 
-这些校验仍不能证明候选对应眼前的聊天：同一 App 可能复用输入框，切会话也可能早于采集识别。键盘始终显示“来源会话”和更新时间；每次新激活、输入文档改变或来源不确定时，先让用户确认来源会话，确认只保存在键盘内存。若无法取得可靠来源，禁用直接插入。不能把短期有效期当作绝对防串会话保证。
+这些校验仍不能证明候选对应眼前的聊天：同一 App 可能复用输入框，切会话也可能早于采集识别。每次新激活、输入文档改变或候选版本变化都要求人工确认来源。单屏识别尚未经连续帧确认时使用 recognized，并显示来源待核对；标题被遮挡则显示“当前会话”。ID/尾部签名/请求版本不一致时禁止发布，不能把短期有效期或匿名来源确认当作绝对防串会话保证。
 
 ### 8.4 插入草稿的安全规则
 
@@ -414,11 +418,11 @@ App Group/
 
 ## 9. PiP 与主 App 展示
 
-已实现（2026-09-23）：画中画固定三行，每行以 “Jarvis” 开头——①会话名、已拼接条数、危险程度（左侧色条：绿/橙/红）；②Jev 判断一句话（意图 → 需要 · 建议）；③下一步。需要上下文时第③行变蓝，提示用户上滑聊天记录：分析时的消息少于设置的上下文条数（`short`），或 Jev 的最佳行动是 `check_history`（`history`，此时一次最多带 50 条）。用户上滑、长图顶部补进更早的消息并停住 1.5 秒后，同一条最新消息自动带着补充的上下文重新分析；每条最新消息最多补充重算 2 次。候选就绪后第③行提示切到 Jarvis 键盘。
+已实现（2026-09-24）：画中画固定四行，仍使用 Visyn 的 414×80pt 视频尺寸。①来源会话、情绪/危险分及实际分析条数；②意图与紧张是否缓解；③需求、行动与实质答复建议；④Jev/候选各自的进度或补历史提示。提示变蓝不改变危险色条。滚动、新消息或切会话时保留有来源的旧判断并标“上次结果”，新 Jev 判断完成即替换，不等待回复；候选新上下文开始时失效，独立生成与排序完成后可选用。
 
-引擎按区域排除 Jarvis 自己的界面：OCR 到以 “Jarvis” 开头的行时，按画中画 414:80 的比例推出整块窗口区域并丢弃其中的行；键盘顶部固定写 “Jarvis 键盘”，它以下全部视为键盘区，内容区下限再让出输入栏高度。不做全局文字过滤。
+引擎用来源、意图、建议的多行准确标签和左对齐/字号/行距组成的簇确认 PiP 区域，窗口可拖动到屏幕下方；不会因为单条聊天以 Jarvis 开头就删掉它。键盘顶部固定写“Jarvis 键盘”，它以下视为键盘区，内容区下限再让出输入栏高度。
 
-Jarvis 键盘已作为 `JarvisKeyboardExtension` target 加入工程（`JarvisShared/ReplyBundle.swift` 由主 App 与键盘共用）。发布策略：会话已确认、标题可读、三条不同候选且排序成功才写 ready；有效期 120 秒，来源新鲜度 15 秒——主 App 看到同一会话且尾部签名不变时每 3 秒续期；停采、离开聊天页、换会话、出现新消息时写 invalid。键盘每次出现都要先点“确认是和「某某」的聊天”，选中文字时需再点一次才替换。
+Jarvis 键盘已作为 `JarvisKeyboardExtension` target 加入工程（`JarvisShared/ReplyBundle.swift` 由主 App 与键盘共用）。发布只依赖同请求/输入版本的三条有效、已排序候选；不依赖 Jev 判断完成、长图或连续观察次数。单屏来源可为 recognized，标题遮挡显示“当前会话”，两者都必须人工核对后插入。有效期从候选完成开始计 120 秒，来源新鲜度取真实采集时间加 15 秒，最小续写间隔 3 秒；计时器不延长新鲜度。停采、离开聊天页、换会话、开始新上下文任务时写 invalid。共享写入失败不能标记就绪。
 
 
 
@@ -482,7 +486,7 @@ PiP 状态： inactive / starting / active / failed
 
 - 新增 Keyboard Extension target、Info.plist、App Group entitlement。
 - 主 App 原子写 `ReplyBundle`。
-- 键盘只读 bundle，自绘三个候选按钮，点击 `insertText`。
+- 键盘只读 bundle，顶部横排三个回复候选并调用 `insertText`；下方离线全拼和普通输入独立可用。
 - 增加过期、版本冲突、选中文本和不可用输入框处理。
 - 保留复制按钮和地球键切换提示。
 

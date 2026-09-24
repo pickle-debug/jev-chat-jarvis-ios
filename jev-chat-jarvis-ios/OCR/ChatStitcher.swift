@@ -145,7 +145,7 @@ nonisolated final class ChatStitcher {
         lastCaptureAt = .distantPast
     }
 
-    func ingest(_ frame: ParsedChatFrame, bitmap: FrameBitmap, preferLiveOnNewSegment: Bool) -> StitchPlacement? {
+    func ingest(_ frame: ParsedChatFrame, bitmap: FrameBitmap) -> StitchPlacement? {
         let motionFrame = MotionFrame(bitmap: bitmap, contentTop: frame.contentTop, contentBottom: frame.contentBottom)
         let previous = last
         // 和上一帧差不多是连续的（同一会话、间隔很短）。
@@ -191,16 +191,32 @@ nonisolated final class ChatStitcher {
                    contradicts(frame, segment: segments[index], offset: offset) { target = nil }
             }
         }
+        // 连续强制 OCR 的静止图片没有滚动量，仍保持上一段和原位置。
+        if target == nil, let previous, frame.messageBubbles.isEmpty,
+           previous.bitmap.size == bitmap.size,
+           FrameBitmap.thumbnailDistance(bitmap.thumbnail(), previous.bitmap.thumbnail()) < 1.5 {
+            target = previous.segmentID
+            offset = previous.offset
+        }
         if target == nil, !frame.messageBubbles.isEmpty,
-           let (index, found) = bestOtherSegment(frame.bubbles, excluding: currentSegmentID, occluders: frame.occluders) {
+           let (index, found) = bestOtherSegment(frame.bubbles, excluding: continuous ? currentSegmentID : nil,
+                                                occluders: frame.occluders) {
             kind = .rejoined
             target = segments[index].id
             offset = found
+            lastPlacementFromText = true
         }
         guard let target else {
+            // 没有文字也没有可靠位移时既不造空段，也不把未知位置写入长图。
+            guard !frame.messageBubbles.isEmpty else {
+                markInterrupted()
+                return nil
+            }
             // 完全接不上：另起一段。按上一帧相对上一段的位置判断新的一段更早还是更新，接到链上。
+            let direction: CGFloat? = continuous
+                ? motionShift.map { CGFloat($0) } ?? previous.map(\.scrollDelta) : nil
             return startSegment(frame: frame, bitmap: bitmap, previous: previous, motionFrame: motionFrame,
-                                preferLive: preferLiveOnNewSegment)
+                                direction: direction)
         }
         guard let index = segments.firstIndex(where: { $0.id == target }) else { return nil }
 
@@ -208,7 +224,8 @@ nonisolated final class ChatStitcher {
             guard let previous, previous.segmentID == target, kind == .extended else { return nil }
             return offset - previous.offset
         }()
-        let changed = merge(frame, offset: offset, into: index, textBacked: lastPlacementFromText && !usedMotion)
+        let changed = frame.messageBubbles.isEmpty ? false
+            : merge(frame, offset: offset, into: index, textBacked: lastPlacementFromText && !usedMotion)
         currentSegmentID = target
         lastCaptureAt = frame.capturedAt
         last = Last(segmentID: target, offset: offset, bitmap: bitmap, motion: motionFrame,
@@ -225,7 +242,7 @@ nonisolated final class ChatStitcher {
 
     /// 接不上时另起一段，并按上一帧的位置把它接到链的更早或更新一端。
     private func startSegment(
-        frame: ParsedChatFrame, bitmap: FrameBitmap, previous: Last?, motionFrame: MotionFrame?, preferLive: Bool
+        frame: ParsedChatFrame, bitmap: FrameBitmap, previous: Last?, motionFrame: MotionFrame?, direction: CGFloat?
     ) -> StitchPlacement? {
         let segment = TranscriptSegment(id: UUID(), isLive: false, createdAt: frame.capturedAt)
         segments.append(segment)
@@ -235,23 +252,20 @@ nonisolated final class ChatStitcher {
             if let unlinked {
                 segments.removeAll { $0.id == unlinked.id }
             } else if chain.count > 1 {
-                segments.removeAll { $0.id == chain.removeLast() }
+                // 保留前驱供方向定位，先取 ID，再执行不修改链的谓词。
+                if let droppedID = chain.reversed().first(where: { $0 != previous?.segmentID && $0 != chain.first }) {
+                    chain.removeAll { $0 == droppedID }
+                    segments.removeAll { $0.id == droppedID }
+                }
             }
         }
-        // 依据上一帧相对上一段的位置判断方向：靠近上边缘 = 往上翻历史。
-        var older = preferLive
-        if let previous, let index = segments.firstIndex(where: { $0.id == previous.segmentID }) {
-            let spread = max(segments[index].coveredBottom - segments[index].coveredTop, 1)
-            let nearTop = (frame.contentTop + previous.offset - segments[index].coveredTop) / spread < 0.45
-            let nearBottom = (segments[index].coveredBottom - (frame.contentBottom + previous.offset)) / spread < 0.45
-            older = nearTop && !nearBottom
-            if nearTop == nearBottom { older = previous.scrollDelta < 0 }
+        if chain.isEmpty {
+            chain.append(segment.id)
+        } else if let previous, let position = chain.firstIndex(of: previous.segmentID),
+                  let direction, abs(direction) > 8 {
+            chain.insert(segment.id, at: direction < 0 ? position + 1 : position)
         }
-        if older, let position = chain.firstIndex(of: previous?.segmentID ?? UUID()) {
-            chain.insert(segment.id, at: position + 1)
-        } else {
-            chain.insert(segment.id, at: 0)
-        }
+        // 方向未知则保留孤立段；等后续文字重叠再并入，不假定它更新或更早。
         refreshLiveFlags()
         currentSegmentID = segment.id
         lastCaptureAt = frame.capturedAt
@@ -261,7 +275,7 @@ nonisolated final class ChatStitcher {
         let changed = merge(frame, offset: 0, into: segments.count - 1, textBacked: true)
         guard let placed = segments.firstIndex(where: { $0.id == segment.id }) else { return nil }
         return StitchPlacement(kind: .newSegment, segmentID: segment.id,
-                               chainIndex: chain.firstIndex(of: segment.id) ?? 0,
+                               chainIndex: chain.firstIndex(of: segment.id) ?? chain.count,
                                offset: 0, scrollDelta: nil, merged: [], changed: changed || placed >= 0)
     }
 
@@ -626,8 +640,10 @@ nonisolated final class ChatStitcher {
             if let i = segments.firstIndex(where: { $0.id == target }) { segments[i] = targetSegment }
             segments.removeAll { $0.id == other.id }
             if let position = chain.firstIndex(of: other.id) {
-                if chain.contains(target) { chain.remove(at: position) }
-                else { chain[position] = target }
+                if let targetPosition = chain.firstIndex(of: target) {
+                    chain.removeAll { $0 == target || $0 == other.id }
+                    chain.insert(target, at: min(min(position, targetPosition), chain.count))
+                } else { chain[position] = target }
             }
             merged.append((other.id, shift))
         }

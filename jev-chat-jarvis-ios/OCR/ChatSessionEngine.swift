@@ -37,14 +37,19 @@ nonisolated struct EngineUpdate: Sendable {
     let sessionID: UUID
     let frameID: UUID
     let detection: Detection
-    /// 两帧确认后才为 true；单帧误判不会产生可分析的会话。
+    /// 单帧版式证据充分，或连续观察到聊天页后为 true。
     let confirmed: Bool
     let conversationID: UUID?
     let title: String?
     /// 实时段内容（side + 文字）变化时递增。展示状态变化不递增。
     let revision: Int
     let segments: [LiveSegmentSummary]
+    let currentMessages: [LiveMessage]
+    let contextMessages: [LiveMessage]
+    /// 兼容展示层，等同 contextMessages。
     let liveMessages: [LiveMessage]
+    /// 当前屏尚未和已知消息链对齐，liveMessages 只包含本段，不推断与其他段的先后。
+    let currentContextIsIsolated: Bool
     let currentSegmentIsLive: Bool
     /// 画面停在实时段底部（没有在翻历史）。
     let viewingLiveTail: Bool
@@ -60,24 +65,20 @@ nonisolated struct EngineUpdate: Sendable {
 /// actor 串行化所有状态；Vision 识别在自己的队列里跑，await 期间不占用 actor。
 /// 采集会话切换时自动重置，旧会话的帧在 OCR 返回后被丢弃，不会写进新会话。
 actor ChatSessionEngine {
-    private let ocr = VisionOCRService()
-    private let parser = ChatLayoutParser()
+    private let recognizer = ChatFrameRecognizer()
     private let stitcher = ChatStitcher()
-    private var ladders: [UUID: ChatLadder] = [:]
-    private var ladderCapacity: Int
     private var anchors = LayoutAnchors()
+    private var epoch: UUID?
+    private var currentMessages: [LiveMessage] = []
+    private var currentHistoryIDs: Set<UUID> = []
 
     private var sessionID: UUID?
     private var frameSize: CGSize?
-    private var lastThumbnail: [UInt8]?
-    private var lastUpdate: EngineUpdate?
 
     private var inChat = false
     private var chatStreak = 0
     private var nonChatStreak = 0
     private var interrupted = false
-    private var lastFrameWasChat = false
-    private var consecutiveSkips = 0
     private var lastRejectReason = "不是聊天页"
 
     private var conversationID: UUID?
@@ -90,39 +91,34 @@ actor ChatSessionEngine {
     private var framesProcessed = 0
     private var framesSkipped = 0
 
-    init(ladderCapacity: Int = ChatLadder.defaultCapacity) {
-        self.ladderCapacity = ladderCapacity
-    }
-
-    func setLadderCapacity(_ value: Int) {
-        ladderCapacity = max(2, value)
-        for ladder in ladders.values { ladder.setCapacity(ladderCapacity) }
-    }
-
     func clear() {
         resetConversation()
         sessionID = nil
         frameSize = nil
-        lastThumbnail = nil
-        lastUpdate = nil
         inChat = false
-        lastFrameWasChat = false
         chatStreak = 0
         nonChatStreak = 0
         framesProcessed = 0
         framesSkipped = 0
+        epoch = nil
     }
 
-    /// 处理一帧。`overlayMarkers`：画中画里会出现的固定前缀，OCR 到以它们开头的行时丢弃，
-    /// 避免 Jarvis 自己的提示被当成聊天内容。
+    /// 处理一帧。画中画标记必须组成版式一致的多行簇，才用于排除自己的界面。
     func process(
-        jpeg: Data, frameID: UUID, sessionID frameSession: UUID, capturedAt: Date, overlayMarkers: [String]
-    ) async -> EngineUpdate? {
-        if sessionID != frameSession {
+        jpeg: Data, frameID: UUID, sessionID frameSession: UUID, capturedAt: Date, overlayMarkers: [String], epoch frameEpoch: UUID
+    ) async -> EngineOutput? {
+        if epoch != frameEpoch || sessionID != frameSession {
             clear()
             sessionID = frameSession
+            epoch = frameEpoch
         }
-        guard let bitmap = FrameBitmap(jpegData: jpeg) else { return nil }
+        guard let recognized = await recognizer.recognize(jpeg: jpeg, frameID: frameID, capturedAt: capturedAt,
+                                                          anchors: anchors, currentTitle: conversationTitle,
+                                                          overlayMarkers: overlayMarkers),
+              sessionID == frameSession, epoch == frameEpoch else { return nil }
+        let bitmap = recognized.bitmap
+        var parsed = recognized.parsed
+        let ocrMs = recognized.ocrMilliseconds
         if let frameSize, frameSize != bitmap.size {
             // 旋转或分辨率变化后像素坐标不可比，重新开始。
             resetConversation()
@@ -132,45 +128,17 @@ actor ChatSessionEngine {
         }
         frameSize = bitmap.size
 
-        // 画面几乎没变 → 跳过 OCR，只把可见消息记一次稳定观察。
-        let thumbnail = bitmap.thumbnail()
-        // 连续跳过有上限：缩略图很粗，版式重复的画面可能误判为“没变”，最多延迟几帧就会重新识别。
-        if let lastThumbnail, consecutiveSkips < 4,
-           FrameBitmap.thumbnailDistance(thumbnail, lastThumbnail) < 1.5, let lastUpdate {
-            framesSkipped += 1
-            consecutiveSkips += 1
-            if lastFrameWasChat {
-                stitcher.confirmStable()
-                return makeUpdate(frameID: frameID, detection: lastUpdate.detection, placement: nil, skipped: true, ocrMs: 0)
-            }
-            // 静止的非聊天页同样要累计，否则离开聊天后永远停在“已检测到聊天页”。
-            return nonChatFrame(frameID: frameID, reason: lastRejectReason, skipped: true, ocrMs: 0)
-        }
-
-        consecutiveSkips = 0
-        let started = Date()
-        let rawLines = await ocr.recognize(bitmap.image)
-        // await 期间可能已经切到新的采集会话：旧帧直接丢弃。
-        guard sessionID == frameSession else { return nil }
-        let ocrMs = Int(Date().timeIntervalSince(started) * 1000)
-        lastThumbnail = thumbnail
         framesProcessed += 1
-
-        let (lines, keyboardTop, occluders) = Self.excludeJarvisUI(rawLines, markers: overlayMarkers, frameSize: bitmap.size)
-        var parsed = parser.parse(
-            lines: lines, bitmap: bitmap, frameID: frameID, capturedAt: capturedAt,
-            anchors: anchors, jarvisKeyboardTop: keyboardTop, occluders: occluders
-        )
         // 整屏都是图片、一条文字消息都没有：只要标题还是这个会话，就是同一个聊天页，不能切断会话。
         if !parsed.isChat, inChat, parsed.messageBubbles.isEmpty, conversationID != nil,
            continuesConversation(parsed) {
             parsed = parsed.continuingChat(reason: "这一屏没有文字消息（可能都是图片）")
         }
 
-        lastFrameWasChat = parsed.isChat
         guard parsed.isChat else {
             lastRejectReason = parsed.rejectReason ?? "不是聊天页"
-            return nonChatFrame(frameID: frameID, reason: lastRejectReason, skipped: false, ocrMs: ocrMs)
+            currentMessages = []
+            return EngineOutput(update: nonChatFrame(frameID: frameID, reason: lastRejectReason, skipped: false, ocrMs: ocrMs), longScreenshot: nil)
         }
         nonChatStreak = 0
         chatStreak += 1
@@ -188,8 +156,9 @@ actor ChatSessionEngine {
             } else {
                 pendingTitle = (title, 1)
             }
-            guard (pendingTitle?.count ?? 0) >= 2 else {
-                return makeUpdate(frameID: frameID, detection: .chat, placement: nil, skipped: false, ocrMs: ocrMs)
+            guard (pendingTitle?.count ?? 0) >= 2 || parsed.hasReliableSingleFrameEvidence else {
+                currentMessages = []
+                return EngineOutput(update: makeUpdate(frameID: frameID, detection: .waiting, placement: nil, skipped: false, ocrMs: ocrMs), longScreenshot: nil)
             }
             startConversation(title: title)
         } else if reentering && title == nil {
@@ -199,76 +168,61 @@ actor ChatSessionEngine {
             pendingTitle = nil
             if conversationTitle == nil, let title { conversationTitle = title }
         }
-        if chatStreak >= 2 { confirmed = true }
+        if chatStreak >= 2 || parsed.hasReliableSingleFrameEvidence { confirmed = true }
         interrupted = false
 
-        let placement = stitcher.ingest(parsed, bitmap: bitmap, preferLiveOnNewSegment: reentering)
-        if let placement {
-            let target = ladder(for: placement.segmentID, width: bitmap.width)
-            for (mergedID, shift) in placement.merged {
-                if let source = ladders.removeValue(forKey: mergedID) { target.absorb(source, shift: shift) }
+        let placement = stitcher.ingest(parsed, bitmap: bitmap)
+        var usedIDs = Set<UUID>()
+        var usedEntryIDs = Set<UUID>()
+        var matchedHistoryIDs = Set<UUID>()
+        let previousMessages = currentMessages
+        currentMessages = parsed.messageBubbles.enumerated().map { index, bubble in
+            let normalized = TextMatch.normalize(bubble.text)
+            let entry = stitcher.currentSegment?.entries.filter {
+                $0.kind == .message && !usedEntryIDs.contains($0.id)
+                    && ($0.side == bubble.side || $0.side == .unknown || bubble.side == .unknown)
+                    && abs($0.top - bubble.rect.minY - (placement?.offset ?? 0)) < max(14, bubble.rect.height)
+                    && TextMatch.similarity($0.normalized, normalized) >= 0.7
+            }.min { abs($0.top - bubble.rect.minY - (placement?.offset ?? 0)) < abs($1.top - bubble.rect.minY - (placement?.offset ?? 0)) }
+            let prior = previousMessages.enumerated().filter {
+                !usedIDs.contains($0.element.id) && $0.element.side == bubble.side
+                    && TextMatch.similarity(TextMatch.normalize($0.element.text), normalized) >= 0.7
+            }.min { abs($0.offset - index) < abs($1.offset - index) }?.element
+            let sameSequence = previousMessages.count == parsed.messageBubbles.count
+                && previousMessages.indices.contains(index)
+                && TextMatch.normalize(previousMessages[index].text) == normalized
+                && previousMessages[index].side == bubble.side
+                && !usedIDs.contains(previousMessages[index].id)
+            let id = sameSequence ? previousMessages[index].id : (entry?.id ?? prior?.id ?? UUID())
+            usedIDs.insert(id)
+            if let entry {
+                usedEntryIDs.insert(entry.id)
+                matchedHistoryIDs.insert(entry.id)
             }
-            // 标题栏只取本帧识别到标题的；被通知横幅遮住的帧不提供。输入栏只在键盘收起时提供。
-            let header: (jpeg: Data, height: Int)? = parsed.titleAnchored
-                ? bitmap.jpegStrip(y: 0, height: Int(parsed.headerBottom)).map { ($0, Int(parsed.headerBottom)) } : nil
-            let footerTop = Int(parsed.contentBottom.rounded())
-            let footer: (jpeg: Data, height: Int)? = parsed.keyboardVisible
-                ? nil : bitmap.jpegStrip(y: footerTop, height: bitmap.height - footerTop).map { ($0, bitmap.height - footerTop) }
-            target.add(
-                bitmap: bitmap, contentTop: parsed.contentTop, contentBottom: parsed.contentBottom,
-                offset: placement.offset, bubbleRects: parsed.bubbles.map(\.rect),
-                capturedAt: capturedAt, header: header, footer: footer
-            )
-            let alive = Set(stitcher.segments.map(\.id))
-            ladders = ladders.filter { alive.contains($0.key) }
+            return LiveMessage(id: id, kind: .message,
+                        side: bubble.side, sideConfidence: bubble.sideConfidence,
+                        text: bubble.text, senderName: bubble.senderName, quote: bubble.quote,
+                        observations: entry?.observations ?? ((prior?.observations ?? 0) + 1), clipped: bubble.clipped)
+        }
+        currentHistoryIDs = matchedHistoryIDs
+        let screenshotInput: LongScreenshotInput? = placement.map {
+            LongScreenshotInput(epoch: frameEpoch, sessionID: frameSession, conversationID: conversationID,
+                                frameID: frameID, bitmap: bitmap, parsed: parsed, placement: $0,
+                                activeSegmentIDs: Set(stitcher.segments.map(\.id)), preferredSegmentID: $0.segmentID)
         }
         anchors.record(parsed)
 
-        return makeUpdate(frameID: frameID, detection: .chat, placement: placement?.kind, skipped: false, ocrMs: ocrMs)
-    }
-
-    /// 导出某段（默认实时段）的长截图为 JPEG。
-    func renderLongScreenshot(segmentID: UUID?, maxPixelHeight: Int) -> Data? {
-        guard let id = segmentID ?? stitcher.liveSegment?.id ?? stitcher.currentSegmentID,
-              let ladder = ladders[id],
-              let image = ladder.render(maxPixelHeight: maxPixelHeight)
-        else { return nil }
-        return FrameBitmap.encodeJPEG(image, quality: 0.85)
+        let detection: EngineUpdate.Detection = currentMessages.isEmpty ? .waiting : .chat
+        return EngineOutput(update: makeUpdate(frameID: frameID, detection: detection, placement: placement?.kind, skipped: false, ocrMs: ocrMs), longScreenshot: screenshotInput)
     }
 
     // MARK: - 内部
 
-    /// 把 Jarvis 自己的界面从 OCR 结果里拿掉，避免“自己的建议被识别成聊天消息”的反馈循环（架构文档 §5.3）。
-    /// - 画中画：每行以 “Jarvis” 开头。找到标记行后，按画中画 414:80 的比例推出整块区域，区域内的行全部丢弃；
-    /// - Jarvis 键盘：顶部固定写 “Jarvis 键盘”。它下面全是键盘，返回它的顶边作为内容区下限。
-    /// 只按区域排除，不做全局文字过滤：用户把候选发出去后，同样的文字会成为真正的聊天气泡。
-    static func excludeJarvisUI(
-        _ lines: [OCRLine], markers: [String], frameSize: CGSize
-    ) -> (lines: [OCRLine], keyboardTop: CGFloat?, occluders: [CGRect]) {
-        let keyboardHeader = lines
-            .filter { $0.text.hasPrefix("Jarvis 键盘") || $0.text.hasPrefix("Jarvis键盘") }
-            .filter { $0.rect.midY > 0.4 * frameSize.height }
-            .min { $0.rect.minY < $1.rect.minY }
-        var regions: [CGRect] = []
-        for line in lines where markers.contains(where: { line.text.hasPrefix($0) }) && line != keyboardHeader {
-            // 画中画一行文字高约为窗口高的 1/5.5，窗口宽高比 414:80。
-            let height = max(line.rect.height * 5.5, 40)
-            let width = height * 414 / 80
-            regions.append(CGRect(x: line.rect.minX - 0.1 * width, y: line.rect.minY - 0.45 * height,
-                                  width: width * 1.15, height: height * 1.1))
-        }
-        let kept = lines.filter { line in
-            if markers.contains(where: { line.text.hasPrefix($0) }) { return false }
-            if let keyboardHeader, line.rect.minY >= keyboardHeader.rect.minY - 2 { return false }
-            return !regions.contains { $0.contains(CGPoint(x: line.rect.midX, y: line.rect.midY)) }
-        }
-        return (kept, keyboardHeader?.rect.minY, regions)
-    }
-
-    /// 这一帧看起来还是当前会话：标题一致，或者标题被遮住但帧尺寸没变、刚刚还在这个聊天页里。
+    /// 无文字消息的帧必须仍看得清同一个标题，不能仅凭上帧还在聊天页继续沿用。
     private func continuesConversation(_ parsed: ParsedChatFrame) -> Bool {
-        guard let current = conversationTitle else { return parsed.title == nil }
-        guard let title = parsed.title, !ChatLayoutParser.isTransientTitle(title) else { return true }
+        guard let current = conversationTitle,
+              let title = parsed.title,
+              !ChatLayoutParser.isTransientTitle(title) else { return false }
         return TextMatch.similarity(TextMatch.normalize(title), TextMatch.normalize(current)) >= 0.6
     }
 
@@ -282,7 +236,7 @@ actor ChatSessionEngine {
             // 只闪了一下、从未确认的会话不保留。
             if !confirmed { resetConversation() }
         }
-        let detection: EngineUpdate.Detection = inChat ? .chat : .notChat(reason: reason)
+        let detection: EngineUpdate.Detection = inChat ? .waiting : .notChat(reason: reason)
         return makeUpdate(frameID: frameID, detection: detection, placement: nil, skipped: skipped, ocrMs: ocrMs)
     }
 
@@ -290,11 +244,14 @@ actor ChatSessionEngine {
         resetConversation()
         conversationID = UUID()
         conversationTitle = title
+        chatStreak = 1
     }
 
     private func resetConversation() {
         stitcher.reset()
-        ladders = [:]
+        currentMessages = []
+        currentHistoryIDs = []
+        anchors = LayoutAnchors()
         conversationID = nil
         conversationTitle = nil
         confirmed = false
@@ -302,13 +259,6 @@ actor ChatSessionEngine {
         interrupted = false
         contentHash = 0
         revision += 1
-    }
-
-    private func ladder(for id: UUID, width: Int) -> ChatLadder {
-        if let existing = ladders[id], existing.width == width { return existing }
-        let ladder = ChatLadder(width: width, capacity: ladderCapacity)
-        ladders[id] = ladder
-        return ladder
     }
 
     private func makeUpdate(
@@ -320,15 +270,17 @@ actor ChatSessionEngine {
                 id: segment.id, isLive: segment.isLive,
                 // 只把文字确认过的消息交给对话列表和分析：画面位移放进来的图片小字不进上下文。
                 messages: segment.entries.filter(\.textConfirmed).map(Self.message),
-                imageSpan: ladders[segment.id]?.span ?? 0,
-                rungCount: ladders[segment.id]?.rungs.count ?? 0,
+                imageSpan: 0,
+                rungCount: 0,
                 chainIndex: chain.firstIndex(of: segment.id)
             )
         }
-        // 分析上下文：沿段链从最早到最新接起来。段与段之间插一条缺口占位，
-        // 表示“这里有没截到的记录”，但顺序是确定的，所以更早的消息仍然能作为上下文。
+        let isolated = summaries.first { $0.id == stitcher.currentSegmentID && $0.chainIndex == nil }
+        // 未对齐的新屏独立分析，不能让旧链的签名替代当前可读内容、持续续期旧候选。
+        // 已在链内时仍沿用最新消息，向上滚动只补历史上下文。
+        let contextIDs = isolated.map { [$0.id] } ?? Array(chain.reversed())
         var live: [LiveMessage] = []
-        for id in chain.reversed() {
+        for id in contextIDs {
             guard let segment = summaries.first(where: { $0.id == id }) else { continue }
             if !live.isEmpty {
                 live.append(LiveMessage(
@@ -338,6 +290,13 @@ actor ChatSessionEngine {
             }
             live += segment.messages
         }
+        let currentTailMissing = currentMessages.last.map { tail in
+            !live.contains {
+                $0.id == tail.id || (currentHistoryIDs.contains($0.id) && $0.side == tail.side && $0.kind == .message
+                    && TextMatch.normalize($0.text) == TextMatch.normalize(tail.text))
+            }
+        } ?? true
+        if currentTailMissing { live = currentMessages }
         var hasher = Hasher()
         hasher.combine(conversationID)
         for message in live where message.kind != .gap {
@@ -360,7 +319,10 @@ actor ChatSessionEngine {
             title: conversationTitle,
             revision: revision,
             segments: summaries,
+            currentMessages: currentMessages,
+            contextMessages: live,
             liveMessages: live,
+            currentContextIsIsolated: isolated != nil || currentTailMissing,
             currentSegmentIsLive: stitcher.currentSegment?.isLive ?? false,
             viewingLiveTail: stitcher.isViewingLiveTail,
             placement: placement,
@@ -369,7 +331,6 @@ actor ChatSessionEngine {
             framesProcessed: framesProcessed,
             framesSkipped: framesSkipped
         )
-        lastUpdate = update
         return update
     }
 

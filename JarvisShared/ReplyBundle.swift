@@ -6,6 +6,15 @@ import Foundation
 /// 键盘只读，不联网、不持有 API Key、不读屏幕帧。键盘每次展示和点击都要重新校验。
 nonisolated struct ReplyBundle: Codable, Equatable, Sendable {
     static let currentSchema = 1
+    static let maxCandidateLength = 120
+
+    static func hasValidCandidateTexts(_ texts: [String]) -> Bool {
+        texts.count == 3 && Set(texts).count == 3
+            && texts.allSatisfy {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && $0.count <= maxCandidateLength
+            }
+    }
 
     enum Status: String, Codable, Sendable {
         case ready
@@ -52,9 +61,8 @@ nonisolated struct ReplyBundle: Codable, Equatable, Sendable {
     func isUsable(now: Date = Date()) -> Bool {
         schemaVersion == Self.currentSchema
             && status == .ready
-            && sourceConfidence == "confirmed"
-            && candidates.count == 3
-            && candidates.allSatisfy { !$0.text.isEmpty && $0.text.count <= 120 }
+            && ["confirmed", "recognized"].contains(sourceConfidence)
+            && Self.hasValidCandidateTexts(candidates.map(\.text))
             && now >= generatedAt.addingTimeInterval(-5)
             && now < expiresAt
             && now < validUntil

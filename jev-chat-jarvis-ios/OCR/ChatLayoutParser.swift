@@ -29,6 +29,7 @@ nonisolated struct ChatLayoutParser {
         var headerBottom: CGFloat = 0.1 * H
         var titleAnchored = false
         var bodyLineHeight: CGFloat = 0
+        var bottomDetected = false
 
         func result(
             score: Double, title: String?, top: CGFloat, bottom: CGFloat,
@@ -38,7 +39,7 @@ nonisolated struct ChatLayoutParser {
                 frameID: frameID, capturedAt: capturedAt, pixelSize: bitmap.size,
                 chatScore: max(0, min(1, score)), isChat: reason == nil,
                 title: title, titleAnchored: titleAnchored, contentTop: top, contentBottom: bottom,
-                headerBottom: min(top, headerBottom), bubbles: bubbles, keyboardVisible: keyboard,
+                headerBottom: min(top, headerBottom), bubbles: bubbles, keyboardVisible: keyboard, inputBarVisible: bottomDetected,
                 bodyLineHeight: bodyLineHeight, occluders: occluders, rejectReason: reason
             )
         }
@@ -72,7 +73,7 @@ nonisolated struct ChatLayoutParser {
             contentTop = max(learned, overlayBottom.map { $0 + 0.025 * H } ?? learned)
         }
 
-        // Jarvis 键盘没有单字按键，靠它顶部的 “Jarvis 键盘” 标记定位；两者取更靠上的。
+        // Jarvis 键盘顶部的标记比字母键更靠上，也包含候选栏；两者取更靠上的。
         let keyboardTop = [Self.detectKeyboardTop(lines, W: W, H: H), jarvisKeyboardTop].compactMap { $0 }.min()
 
         // 页面背景色只作“气泡是否彩色”的弱参考；照片壁纸下它不代表输入栏或气泡外的颜色。
@@ -80,14 +81,13 @@ nonisolated struct ChatLayoutParser {
         let pageColor = bitmap.dominantColor(in: midRegion, excluding: lines.map(\.rect))
 
         var contentBottom: CGFloat = 0.885 * H
-        var bottomDetected = false
         if let bar = Self.detectInputBarTop(bitmap), bar > 0.8 * H {
             contentBottom = bar
             bottomDetected = true
         }
         if let keyboardTop {
             // 键盘上方还有输入栏（微信约 50pt，扣掉气泡与输入栏的间距后 ≈ 0.045H）和系统键盘的候选栏。
-            // Jarvis 键盘自带标记且没有候选栏，只需再让出输入栏高度。
+            // Jarvis 标记已位于候选栏上方，只需再让出输入栏高度。
             let fromJarvis = jarvisKeyboardTop.map { abs($0 - keyboardTop) < 1 } ?? false
             let margin: CGFloat = fromJarvis ? 0.045 : (bottomDetected ? 0.06 : 0.12)
             contentBottom = min(contentBottom, keyboardTop - margin * H)

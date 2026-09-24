@@ -1,32 +1,49 @@
 import UIKit
 
-/// Jarvis 键盘：只读主 App 写好的候选，自绘三个按钮，点击后 `insertText`（架构文档 §8）。
-///
-/// 不是完整输入法：需要改字时用地球键切回原来的中文输入法。不联网、不持有密钥、不读屏幕。
-/// 顶部文字固定以 “Jarvis 键盘” 开头：主 App 录屏识别到它就知道下方是键盘区，不会把候选当成聊天内容。
+/// 完整输入法：顶部三个 Jarvis 回复候选，下面保留本地拼音和普通输入。
+/// “Jarvis 键盘”前缀供录屏解析器识别键盘区域，不能改成聊天内容。
 final class KeyboardViewController: UIInputViewController {
+    private enum Layout { case letters, numbers, symbols }
     private let headerLabel = UILabel()
     private let noteLabel = UILabel()
-    private let candidateStack = UIStackView()
     private let confirmButton = UIButton(type: .system)
+    private let candidateStack = UIStackView()
+    private let compositionLabel = UILabel()
+    private let pinyinScroll = UIScrollView()
+    private let pinyinStack = UIStackView()
+    private let keyStack = UIStackView()
+    private let pinyinEngine = PinyinInputEngine()
+    private var pinyinCandidates: [PinyinInputEngine.Candidate] = []
+    private var visiblePinyinCount = 30
+    private var renderedComposition = ""
+    private var layout: Layout = .letters
+    private var chinese = true
+    private var uppercase = false
+    private var composition = ""
+    private var compositionDocumentID: UUID?
     private var switchButton: UIButton?
-
+    private var heightConstraint: NSLayoutConstraint?
     private var bundle: ReplyBundle?
     private var lastModified: Date?
     private var timer: Timer?
-    /// 用户确认过“就是这个会话”的 bundleID + 文档标识。只存在键盘内存里。
+    private var deleteTimer: Timer?
     private var confirmedKey: String?
     private var pendingReplace: (candidateID: String, until: Date)?
+    private var feedback: (text: String, until: Date)?
 
     override func viewDidLoad() {
         super.viewDidLoad()
         buildLayout()
+        rebuildKeys()
+        renderComposition()
+        reload(force: true)
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        // 每次键盘重新出现都要重新确认来源：输入框可能已经换成另一个联系人。
         confirmedKey = nil
+        pendingReplace = nil
+        resetCompositionIfDocumentChanged()
         reload(force: true)
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -38,212 +55,470 @@ final class KeyboardViewController: UIInputViewController {
         super.viewWillDisappear(animated)
         timer?.invalidate()
         timer = nil
+        stopDeleting()
     }
 
     override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
-        render()
+        resetCompositionIfDocumentChanged()
+        renderSuggestions()
     }
 
     override func selectionDidChange(_ textInput: UITextInput?) {
         super.selectionDidChange(textInput)
-        render()
+        resetCompositionIfDocumentChanged()
+        pendingReplace = nil
+        renderSuggestions()
     }
 
     override func viewWillLayoutSubviews() {
         super.viewWillLayoutSubviews()
         switchButton?.isHidden = !needsInputModeSwitchKey
+        // Keep the keyboard content above the system home-indicator/input-mode area.
+        let compact = traitCollection.verticalSizeClass == .compact
+        heightConstraint?.constant = (compact ? 308 : 354) + view.safeAreaInsets.bottom
     }
 
-    // MARK: - 数据
-
-    /// 文件变化时重新读取；没变也要重新渲染，让过期在屏幕上及时体现。
-    private func reload(force: Bool) {
-        let modified = ReplyBundleStore.modificationDate()
-        if force || modified != lastModified {
-            lastModified = modified
-            let next = ReplyBundleStore.load()
-            if next?.bundleID != bundle?.bundleID { confirmedKey = nil; pendingReplace = nil }
-            bundle = next
-        }
-        render()
-    }
+    // MARK: - Shared suggestions
 
     private var confirmationKey: String? {
         guard let bundle else { return nil }
         return "\(bundle.bundleID)|\(textDocumentProxy.documentIdentifier.uuidString)"
     }
 
-    private var usableBundle: ReplyBundle? {
-        guard let bundle, bundle.isUsable() else { return nil }
-        return bundle
+    private func reload(force: Bool) {
+        let modified = ReplyBundleStore.modificationDate()
+        if force || modified != lastModified {
+            lastModified = modified
+            let next = ReplyBundleStore.load()
+            if next?.bundleID != bundle?.bundleID {
+                confirmedKey = nil
+                pendingReplace = nil
+                feedback = nil
+            }
+            bundle = next
+        }
+        // Even an unchanged file can expire while the host app is suspended.
+        renderSuggestions()
     }
 
-    // MARK: - 渲染
+    private func renderSuggestions() {
+        clear(candidateStack)
+        let usable = bundle.flatMap { $0.isUsable() ? $0 : nil }
+        headerLabel.text = usable.map { "Jarvis 键盘 · \($0.sourceTitle)" } ?? "Jarvis 键盘 · 暂无可用建议"
+        let confirmed = usable != nil && confirmedKey == confirmationKey
+        let anonymous = usable?.sourceTitle == "当前会话" || usable?.sourceConfidence == "recognized"
+        confirmButton.isHidden = usable == nil || confirmed
+        confirmButton.setTitle(anonymous ? "确认建议对应当前聊天" : "确认会话", for: .normal)
+        confirmButton.accessibilityLabel = anonymous ? "确认建议对应当前聊天" : usable.map { "确认当前正在和「\($0.sourceTitle)」聊天" }
 
-    private func render() {
-        candidateStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        guard let bundle = usableBundle else {
-            headerLabel.text = "Jarvis 键盘 · 暂无可用建议"
-            noteLabel.text = unavailableReason()
-            confirmButton.isHidden = true
-            for _ in 0..<3 { candidateStack.addArrangedSubview(placeholderRow()) }
-            return
-        }
-        let age = max(0, Int(Date().timeIntervalSince(bundle.generatedAt)))
-        headerLabel.text = "Jarvis 键盘 · 来源：\(bundle.sourceTitle) · \(age < 5 ? "刚刚" : "\(age) 秒前")"
-        let confirmed = confirmedKey == confirmationKey
-        confirmButton.isHidden = confirmed
-        confirmButton.setTitle("确认是和「\(bundle.sourceTitle)」的聊天", for: .normal)
-        if let selected = textDocumentProxy.selectedText, !selected.isEmpty {
-            noteLabel.text = "已选中文字：点候选会替换选中内容，需再点一次确认"
-        } else if !confirmed {
-            noteLabel.text = "先确认当前输入框就是这个会话，再点候选插入。\(bundle.summary.map { "判断：\($0)" } ?? "")"
+        if let feedback, feedback.until > Date() {
+            noteLabel.text = feedback.text
+        } else if let usable {
+            noteLabel.text = confirmed
+                ? (usable.summary.map { "判断：\($0)" } ?? "点上方建议插入；下方可以继续输入和修改")
+                : (anonymous ? "来源待核对：\(usable.sourceTitle) · 请确认当前聊天" : "确认当前是「\(usable.sourceTitle)」后，可插入建议")
         } else {
-            noteLabel.text = bundle.summary.map { "判断：\($0)" } ?? "从上到下推荐程度由低到高"
+            noteLabel.text = unavailableReason() + " · 可继续打字"
         }
-        for candidate in bundle.candidates.sorted(by: { $0.rank < $1.rank }) {
-            candidateStack.addArrangedSubview(candidateRow(candidate, enabled: confirmed))
+        let candidates = usable?.candidates.sorted { $0.rank < $1.rank } ?? []
+        for index in 0..<3 {
+            guard index < candidates.count else {
+                let placeholder = makeKey(index == 1 ? "暂无回复建议" : "—", fontSize: 12)
+                placeholder.isEnabled = false
+                placeholder.alpha = 0.55
+                candidateStack.addArrangedSubview(placeholder)
+                continue
+            }
+            let candidate = candidates[index]
+            let button = makeKey(candidate.text, fontSize: 13)
+            button.titleLabel?.numberOfLines = 2
+            button.titleLabel?.lineBreakMode = .byTruncatingTail
+            button.isEnabled = confirmed
+            button.alpha = confirmed ? 1 : 0.5
+            button.accessibilityLabel = "回复建议\(index + 1)：\(candidate.text)"
+            if candidate.rank == 3 {
+                button.backgroundColor = UIColor.systemIndigo.withAlphaComponent(0.18)
+                button.accessibilityHint = "优先推荐，点击插入输入框"
+            }
+            button.addAction(UIAction { [weak self] _ in
+                self?.insertSuggestion(candidate)
+            }, for: .touchUpInside)
+            candidateStack.addArrangedSubview(button)
         }
     }
 
     private func unavailableReason() -> String {
-        guard let bundle else { return "打开 Jarvis 开始录屏，在聊天窗口停留片刻后回来。" }
-        if bundle.status == .invalid { return bundle.note ?? "会话已变化，等待新的建议。" }
-        if Date() >= bundle.validUntil || Date() >= bundle.expiresAt { return "建议已过期：会话可能已更新，回到 Jarvis 画中画查看最新状态。" }
-        return "建议不完整，已禁用插入。"
+        guard let bundle else { return "等待聊天分析" }
+        if bundle.status == .invalid { return bundle.note ?? "等待新的建议" }
+        if Date() >= bundle.validUntil || Date() >= bundle.expiresAt { return "建议已过期" }
+        return "建议暂不可用"
     }
 
-    private func candidateRow(_ candidate: ReplyBundle.Candidate, enabled: Bool) -> UIView {
-        let button = UIButton(type: .system)
-        let marker = ["①", "②", "③"][max(0, min(2, candidate.rank - 1))]
-        let top = candidate.rank == 3
-        var config = UIButton.Configuration.filled()
-        config.title = "\(marker) \(candidate.text)"
-        config.subtitle = top ? "优先推荐" : (candidate.rank == 1 ? "推荐程度较低" : nil)
-        config.titleLineBreakMode = .byTruncatingTail
-        config.baseBackgroundColor = top ? UIColor.systemIndigo.withAlphaComponent(0.18) : .secondarySystemBackground
-        config.baseForegroundColor = .label
-        config.cornerStyle = .medium
-        config.contentInsets = .init(top: 6, leading: 10, bottom: 6, trailing: 10)
-        config.titleAlignment = .leading
-        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
-            var attributes = attributes
-            attributes.font = .systemFont(ofSize: 15, weight: top ? .semibold : .regular)
-            return attributes
+    private func showFeedback(_ text: String) {
+        feedback = (text, Date().addingTimeInterval(4))
+        renderSuggestions()
+    }
+
+    private func insertSuggestion(_ candidate: ReplyBundle.Candidate) {
+        guard composition.isEmpty else {
+            showFeedback("请先选词或点拼音原文上屏，再插入回复建议")
+            return
         }
-        config.subtitleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
-            var attributes = attributes
-            attributes.font = .systemFont(ofSize: 11)
-            attributes.foregroundColor = .secondaryLabel
-            return attributes
-        }
-        button.configuration = config
-        button.contentHorizontalAlignment = .leading
-        button.isEnabled = enabled
-        button.titleLabel?.numberOfLines = 2
-        // 绑定候选 ID 与文本，点击时重新读文件确认没有被替换成另一条。
-        let id = candidate.id, text = candidate.text
-        button.addAction(UIAction { [weak self] _ in self?.insert(candidateID: id, text: text) }, for: .touchUpInside)
-        return button
-    }
-
-    private func placeholderRow() -> UIView {
-        let view = UIView()
-        view.backgroundColor = .secondarySystemBackground.withAlphaComponent(0.5)
-        view.layer.cornerRadius = 8
-        return view
-    }
-
-    // MARK: - 插入
-
-    private func insert(candidateID: String, text: String) {
-        // 点击时重新读取共享文件，确认版本仍然一致。
         let latest = ReplyBundleStore.load()
-        guard let shown = bundle, let latest, latest.isUsable(), latest.bundleID == shown.bundleID,
+        guard let shown = bundle, let latest, latest.isUsable(),
+              latest.bundleID == shown.bundleID,
               latest.sessionID == shown.sessionID, latest.conversationID == shown.conversationID,
               latest.revision == shown.revision, latest.analysisRequestID == shown.analysisRequestID,
-              latest.candidates.contains(where: { $0.id == candidateID && $0.text == text })
+              latest.candidates.contains(where: { $0.id == candidate.id && $0.text == candidate.text })
         else {
-            noteLabel.text = "建议已更新，请点“刷新”后再选"
             reload(force: true)
+            showFeedback("建议已更新，请重新确认会话后选择")
             return
         }
         guard confirmedKey == confirmationKey else { return }
         if let selected = textDocumentProxy.selectedText, !selected.isEmpty {
-            if pendingReplace?.candidateID != candidateID || (pendingReplace?.until ?? .distantPast) < Date() {
-                pendingReplace = (candidateID, Date().addingTimeInterval(3))
-                noteLabel.text = "再点一次这条候选，替换选中的文字"
+            if pendingReplace?.candidateID != candidate.id || (pendingReplace?.until ?? .distantPast) < Date() {
+                pendingReplace = (candidate.id, Date().addingTimeInterval(3))
+                showFeedback("再点一次这条建议，替换选中的文字")
                 return
             }
         }
         pendingReplace = nil
-        textDocumentProxy.insertText(text)
-        noteLabel.text = "已插入，请在聊天 App 里检查后自己发送"
+        textDocumentProxy.insertText(candidate.text)
+        showFeedback("已插入，可继续修改；请自行发送")
     }
 
-    // MARK: - 布局
+    // MARK: - Local composition
+
+    private func resetCompositionIfDocumentChanged() {
+        guard let compositionDocumentID,
+              compositionDocumentID != textDocumentProxy.documentIdentifier else { return }
+        composition = ""
+        self.compositionDocumentID = nil
+        renderComposition()
+    }
+
+    private func renderComposition() {
+        if renderedComposition != composition {
+            renderedComposition = composition
+            visiblePinyinCount = 30
+        }
+        pinyinCandidates = composition.isEmpty ? [] : pinyinEngine.candidates(for: composition)
+        compositionLabel.text = composition.isEmpty ? (chinese ? "拼音" : "English") : composition
+        clear(pinyinStack)
+        if composition.isEmpty {
+            let hint = UILabel()
+            hint.text = chinese ? "输入拼音，空格选词 · v 输入 ü" : "英文输入"
+            hint.font = .systemFont(ofSize: 12)
+            hint.textColor = .secondaryLabel
+            pinyinStack.addArrangedSubview(hint)
+        } else {
+            for candidate in pinyinCandidates.prefix(visiblePinyinCount) {
+                let button = makeKey(candidate.text, fontSize: 18)
+                button.accessibilityLabel = "拼音候选：\(candidate.text)"
+                button.addAction(UIAction { [weak self] _ in self?.choose(candidate) }, for: .touchUpInside)
+                pinyinStack.addArrangedSubview(button)
+                button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            }
+            // Common syllables can have hundreds of characters; instantiate more only on demand.
+            if pinyinCandidates.count > visiblePinyinCount {
+                let more = makeKey("更多", fontSize: 14)
+                more.addAction(UIAction { [weak self] _ in
+                    guard let self else { return }
+                    let offset = pinyinScroll.contentOffset
+                    visiblePinyinCount += 30
+                    renderComposition()
+                    pinyinScroll.layoutIfNeeded()
+                    pinyinScroll.setContentOffset(offset, animated: false)
+                }, for: .touchUpInside)
+                pinyinStack.addArrangedSubview(more)
+            }
+            let literal = makeKey(composition, fontSize: 14)
+            literal.accessibilityLabel = "直接输入拼音原文：\(composition)"
+            literal.addAction(UIAction { [weak self] _ in self?.commitLiteral() }, for: .touchUpInside)
+            pinyinStack.addArrangedSubview(literal)
+        }
+        pinyinScroll.setContentOffset(.zero, animated: false)
+    }
+
+    private func choose(_ candidate: PinyinInputEngine.Candidate) {
+        resetCompositionIfDocumentChanged()
+        guard !composition.isEmpty, candidate.consumedPinyinCount > 0,
+              candidate.consumedPinyinCount <= composition.count,
+              pinyinCandidates.contains(where: {
+                  $0.text == candidate.text && $0.consumedPinyinCount == candidate.consumedPinyinCount
+              }) else { return }
+        composition = String(composition.dropFirst(candidate.consumedPinyinCount))
+        if composition.isEmpty { compositionDocumentID = nil }
+        textDocumentProxy.insertText(candidate.text)
+        renderComposition()
+    }
+
+    private func commitLiteral() {
+        resetCompositionIfDocumentChanged()
+        guard !composition.isEmpty else { return }
+        let text = composition
+        composition = ""
+        compositionDocumentID = nil
+        textDocumentProxy.insertText(text)
+        renderComposition()
+    }
+
+    private func type(_ text: String) {
+        resetCompositionIfDocumentChanged()
+        pendingReplace = nil
+        if chinese && layout == .letters && (text == "'" || text.range(of: "^[a-z]+$", options: .regularExpression) != nil) {
+            if text == "'", composition.isEmpty || composition.last == "'" { return }
+            guard composition.count < 64 else { return }
+            compositionDocumentID = textDocumentProxy.documentIdentifier
+            composition += text
+            renderComposition()
+        } else {
+            if chinese, text.rangeOfCharacter(from: .punctuationCharacters) != nil,
+               let candidate = pinyinCandidates.first(where: { $0.consumedPinyinCount == composition.count }) {
+                choose(candidate)
+            } else {
+                commitLiteral()
+            }
+            textDocumentProxy.insertText(text)
+            if uppercase {
+                uppercase = false
+                rebuildKeys()
+            }
+        }
+    }
+
+    private func space() {
+        resetCompositionIfDocumentChanged()
+        if !composition.isEmpty {
+            if let first = pinyinCandidates.first { choose(first) } else { commitLiteral() }
+        } else {
+            textDocumentProxy.insertText(" ")
+        }
+    }
+
+    private func enter() {
+        // Like an IME, Return first commits the literal composition without sending a message.
+        if !composition.isEmpty { commitLiteral() } else { textDocumentProxy.insertText("\n") }
+    }
+
+    private func deleteBackward() {
+        resetCompositionIfDocumentChanged()
+        pendingReplace = nil
+        if composition.isEmpty {
+            textDocumentProxy.deleteBackward()
+        } else {
+            composition.removeLast()
+            if composition.isEmpty { compositionDocumentID = nil }
+            renderComposition()
+        }
+    }
+
+    @objc private func repeatDelete(_ recognizer: UILongPressGestureRecognizer) {
+        if recognizer.state == .began {
+            deleteBackward()
+            deleteTimer = Timer.scheduledTimer(withTimeInterval: 0.09, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.deleteBackward() }
+            }
+        } else if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed {
+            stopDeleting()
+        }
+    }
+
+    private func stopDeleting() {
+        deleteTimer?.invalidate()
+        deleteTimer = nil
+    }
+
+    @objc private func switchInputMode(_ sender: UIButton, with event: UIEvent) {
+        commitLiteral()
+        handleInputModeList(from: sender, with: event)
+    }
+
+    private func changeLayout(_ next: Layout) {
+        commitLiteral()
+        layout = next
+        rebuildKeys()
+    }
+
+    private func toggleLanguage() {
+        commitLiteral()
+        chinese.toggle()
+        uppercase = false
+        layout = .letters
+        rebuildKeys()
+        renderComposition()
+    }
+
+    // MARK: - Key layout
+
+    private func rebuildKeys() {
+        stopDeleting()
+        clear(keyStack)
+        let rows: [String]
+        switch layout {
+        case .letters: rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+        case .numbers: rows = ["1234567890", "-/:;()¥&@\"", ".,?!'"]
+        case .symbols: rows = ["[]{}#%^*+=", "_\\|~<>$€£•", "…，。？！"]
+        }
+        for (index, characters) in rows.enumerated() {
+            let row = UIStackView()
+            row.axis = .horizontal
+            row.spacing = 5
+            row.distribution = .fillEqually
+            if index == 2 {
+                let title = layout == .letters ? (chinese ? "分词" : "⇧") : (layout == .numbers ? "#+=" : "123")
+                let control = makeKey(title, fontSize: 15)
+                if !chinese && uppercase && layout == .letters {
+                    control.backgroundColor = UIColor.systemIndigo.withAlphaComponent(0.2)
+                }
+                control.accessibilityLabel = layout == .letters ? (chinese ? "拼音分隔符" : "切换大小写") : "切换数字符号"
+                control.addAction(UIAction { [weak self] _ in
+                    guard let self else { return }
+                    if layout == .letters {
+                        if chinese { type("'") } else { uppercase.toggle(); rebuildKeys() }
+                    } else { changeLayout(layout == .numbers ? .symbols : .numbers) }
+                }, for: .touchUpInside)
+                row.addArrangedSubview(control)
+            }
+            for character in characters {
+                let text = String(character)
+                let displayed = !chinese && uppercase && layout == .letters ? text.uppercased() : text
+                let button = makeKey(displayed, fontSize: 21)
+                button.addAction(UIAction { [weak self] _ in self?.type(displayed) }, for: .touchUpInside)
+                row.addArrangedSubview(button)
+            }
+            if index == 2 {
+                let delete = makeKey("", symbol: "delete.left", accessibility: "删除")
+                delete.addAction(UIAction { [weak self] _ in self?.deleteBackward() }, for: .touchUpInside)
+                delete.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(repeatDelete(_:))))
+                row.addArrangedSubview(delete)
+            }
+            keyStack.addArrangedSubview(row)
+        }
+        let bottom = UIStackView()
+        bottom.axis = .horizontal
+        bottom.spacing = 5
+        let mode = makeKey(layout == .letters ? "123" : (chinese ? "拼音" : "ABC"), fontSize: 14)
+        mode.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            changeLayout(layout == .letters ? .numbers : .letters)
+        }, for: .touchUpInside)
+        let globe = makeKey("", symbol: "globe", accessibility: "切换输入法")
+        globe.addTarget(self, action: #selector(switchInputMode(_:with:)), for: .allTouchEvents)
+        globe.isHidden = !needsInputModeSwitchKey
+        switchButton = globe
+        let language = makeKey(chinese ? "中/英" : "英/中", fontSize: 13)
+        language.addAction(UIAction { [weak self] _ in self?.toggleLanguage() }, for: .touchUpInside)
+        let space = makeKey("空格", fontSize: 15)
+        space.addAction(UIAction { [weak self] _ in self?.space() }, for: .touchUpInside)
+        let punctuation = makeKey(chinese ? "，" : ".", fontSize: 20)
+        punctuation.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            type(chinese ? "，" : ".")
+        }, for: .touchUpInside)
+        let enter = makeKey("", symbol: "return", accessibility: "回车")
+        enter.addAction(UIAction { [weak self] _ in self?.enter() }, for: .touchUpInside)
+        for button in [mode, globe, language, space, punctuation, enter] { bottom.addArrangedSubview(button) }
+        for button in [mode, globe, language, punctuation, enter] {
+            let width = button.widthAnchor.constraint(equalTo: bottom.widthAnchor, multiplier: 0.13)
+            width.priority = .defaultHigh
+            width.isActive = true
+        }
+        keyStack.addArrangedSubview(bottom)
+    }
 
     private func buildLayout() {
+        view.backgroundColor = .systemGroupedBackground
         headerLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         headerLabel.textColor = .secondaryLabel
+        headerLabel.lineBreakMode = .byTruncatingTail
+        headerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         noteLabel.font = .systemFont(ofSize: 11)
         noteLabel.textColor = .secondaryLabel
-        noteLabel.numberOfLines = 2
-        confirmButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        noteLabel.lineBreakMode = .byTruncatingTail
+        confirmButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+        confirmButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         confirmButton.addAction(UIAction { [weak self] _ in
             guard let self else { return }
             confirmedKey = confirmationKey
-            render()
+            feedback = nil
+            renderSuggestions()
         }, for: .touchUpInside)
-
-        candidateStack.axis = .vertical
-        candidateStack.spacing = 6
+        let dismiss = makeKey("", symbol: "keyboard.chevron.compact.down", accessibility: "收起键盘")
+        dismiss.addAction(UIAction { [weak self] _ in
+            self?.commitLiteral()
+            self?.dismissKeyboard()
+        }, for: .touchUpInside)
+        dismiss.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        let header = UIStackView(arrangedSubviews: [headerLabel, confirmButton, dismiss])
+        header.spacing = 6
+        header.alignment = .fill
+        candidateStack.axis = .horizontal
+        candidateStack.spacing = 5
         candidateStack.distribution = .fillEqually
-
-        let globe = controlButton("globe", label: "切换输入法")
-        globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
-        switchButton = globe
-        let refresh = controlButton("arrow.clockwise", label: "刷新")
-        refresh.addAction(UIAction { [weak self] _ in self?.reload(force: true) }, for: .touchUpInside)
-        let delete = controlButton("delete.left", label: "删除")
-        delete.addAction(UIAction { [weak self] _ in self?.textDocumentProxy.deleteBackward() }, for: .touchUpInside)
-        let newline = controlButton("return", label: "换行")
-        newline.addAction(UIAction { [weak self] _ in self?.textDocumentProxy.insertText("\n") }, for: .touchUpInside)
-        let dismiss = controlButton("keyboard.chevron.compact.down", label: "收起键盘")
-        dismiss.addAction(UIAction { [weak self] _ in self?.dismissKeyboard() }, for: .touchUpInside)
-        let controls = UIStackView(arrangedSubviews: [globe, refresh, UIView(), delete, newline, dismiss])
-        controls.spacing = 8
-        controls.alignment = .center
-
-        let headerRow = UIStackView(arrangedSubviews: [headerLabel, UIView(), confirmButton])
-        headerRow.alignment = .center
-        headerRow.spacing = 6
-
-        let stack = UIStackView(arrangedSubviews: [headerRow, noteLabel, candidateStack, controls])
-        stack.axis = .vertical
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
-        let height = view.heightAnchor.constraint(equalToConstant: 268)
+        compositionLabel.font = .systemFont(ofSize: 12)
+        compositionLabel.textColor = .secondaryLabel
+        compositionLabel.lineBreakMode = .byTruncatingHead
+        compositionLabel.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        pinyinScroll.showsHorizontalScrollIndicator = false
+        pinyinScroll.alwaysBounceHorizontal = true
+        pinyinScroll.addSubview(pinyinStack)
+        pinyinStack.axis = .horizontal
+        pinyinStack.spacing = 10
+        pinyinStack.alignment = .fill
+        pinyinStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            pinyinStack.leadingAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.leadingAnchor),
+            pinyinStack.trailingAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.trailingAnchor),
+            pinyinStack.topAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.topAnchor),
+            pinyinStack.bottomAnchor.constraint(equalTo: pinyinScroll.contentLayoutGuide.bottomAnchor),
+            pinyinStack.heightAnchor.constraint(equalTo: pinyinScroll.frameLayoutGuide.heightAnchor)
+        ])
+        let compositionRow = UIStackView(arrangedSubviews: [compositionLabel, pinyinScroll])
+        compositionRow.spacing = 6
+        keyStack.axis = .vertical
+        keyStack.spacing = 6
+        keyStack.distribution = .fillEqually
+        let root = UIStackView(arrangedSubviews: [header, candidateStack, noteLabel, compositionRow, keyStack])
+        root.axis = .vertical
+        root.spacing = 5
+        root.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(root)
+        let height = view.heightAnchor.constraint(equalToConstant: 354)
         height.priority = .defaultHigh
+        heightConstraint = height
         NSLayoutConstraint.activate([
             height,
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
-            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -6),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            controls.heightAnchor.constraint(equalToConstant: 38)
+            root.topAnchor.constraint(equalTo: view.topAnchor, constant: 5),
+            root.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 5),
+            root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -5),
+            root.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -5),
+            header.heightAnchor.constraint(equalToConstant: 26),
+            candidateStack.heightAnchor.constraint(equalToConstant: 42),
+            noteLabel.heightAnchor.constraint(equalToConstant: 16),
+            compositionRow.heightAnchor.constraint(equalToConstant: 32)
         ])
     }
 
-    private func controlButton(_ symbol: String, label: String) -> UIButton {
-        var config = UIButton.Configuration.gray()
-        config.image = UIImage(systemName: symbol)
-        config.cornerStyle = .medium
-        let button = UIButton(configuration: config)
-        button.accessibilityLabel = label
-        button.widthAnchor.constraint(equalToConstant: 48).isActive = true
+    private func makeKey(_ title: String, symbol: String? = nil, accessibility: String? = nil, fontSize: CGFloat = 18) -> UIButton {
+        let button = UIButton(type: .system)
+        if let symbol { button.setImage(UIImage(systemName: symbol), for: .normal) }
+        else { button.setTitle(title, for: .normal) }
+        button.titleLabel?.font = .systemFont(ofSize: fontSize)
+        button.titleLabel?.adjustsFontSizeToFitWidth = true
+        button.titleLabel?.minimumScaleFactor = 0.7
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        button.tintColor = .label
+        button.setTitleColor(.label, for: .normal)
+        button.backgroundColor = .secondarySystemGroupedBackground
+        button.layer.cornerRadius = 5
+        button.accessibilityLabel = accessibility ?? title
         return button
+    }
+
+    private func clear(_ stack: UIStackView) {
+        stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
     }
 }

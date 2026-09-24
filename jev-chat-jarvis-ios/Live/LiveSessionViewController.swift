@@ -42,7 +42,8 @@ final class LiveSessionViewController: UIViewController {
         analysisLabel.text = coordinator.analysisLine
         if let latest = coordinator.latest {
             statsLabel.text = "收到 \(coordinator.framesReceived) 帧 · OCR \(latest.framesProcessed) 帧"
-                + " · 画面未变跳过 \(latest.framesSkipped) 帧 · 最近一次 OCR \(latest.ocrMilliseconds)ms"
+                + " · 最近一次 OCR \(latest.ocrMilliseconds)ms"
+                + "\n长图：\(coordinator.isSavingLongScreenshot ? "后台拼接中" : "待机") · 候选：\(coordinator.replyLine)"
         } else {
             statsLabel.text = "收到 \(coordinator.framesReceived) 帧"
         }
@@ -54,39 +55,38 @@ final class LiveSessionViewController: UIViewController {
     }
 
     private func renderOutcome() {
-        guard let outcome = coordinator.scheduler.outcome else {
-            judgeLabel.text = "暂无判断结果"
+        var judge: [String] = []
+        if let outcome = coordinator.scheduler.outcome {
+            if outcome.stale { judge.append("⚠︎ 以下为上一次 Jev 判断，新判断完成后更新") }
+            if let analysis = outcome.analysis {
+                judge += AnalysisPresentation.judgeLines(analysis)
+                judge.append("判断耗时 \(analysis.latencyMs)ms")
+            } else if let error = outcome.judgeError { judge.append("判断失败：\(error)") }
+        } else {
+            judge.append(coordinator.analysisLine)
+        }
+        judgeLabel.text = judge.joined(separator: "\n")
+        guard let outcome = coordinator.replyScheduler.outcome else {
             candidatesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-            replyNoteLabel.text = ""
+            replyNoteLabel.text = coordinator.replyLine
             renderedOutcomeKey = nil
             return
         }
-        var judge: [String] = []
-        if outcome.stale { judge.append("⚠︎ 会话已有新内容，以下结论基于之前的消息") }
-        if let analysis = outcome.analysis {
-            judge += AnalysisPresentation.judgeLines(analysis)
-            judge.append("判断耗时 \(analysis.latencyMs)ms")
-        } else if let error = outcome.judgeError {
-            judge.append("判断失败：\(error)")
-        } else {
-            judge.append("正在判断…")
-        }
-        judgeLabel.text = judge.joined(separator: "\n")
-
         // 候选只在内容变化时重建，避免每帧刷新打断用户点“复制”。
-        let key = "\(outcome.requestID)|\(outcome.replies?.map(\.text).joined() ?? "")|\(outcome.repliesUnranked)"
+        let key = "\(outcome.request.id)|\(outcome.replies.map(\.text).joined())|\(outcome.repliesUnranked)|\(outcome.stale)"
         if key != renderedOutcomeKey {
             renderedOutcomeKey = key
             AnalysisPresentation.fill(
-                candidatesStack, with: outcome.replies ?? [], unranked: outcome.repliesUnranked
+                candidatesStack, with: outcome.replies, unranked: outcome.repliesUnranked,
+                enabled: !outcome.stale
             ) { [weak self] _ in
                 self?.analysisLabel.text = "已复制，可切回聊天 App 粘贴"
             }
         }
-        if let error = outcome.replyError {
+        if outcome.stale {
+            replyNoteLabel.text = "上一份候选暂不可复制，等待当前内容分析完成"
+        } else if let error = outcome.error {
             replyNoteLabel.text = error
-        } else if outcome.replies == nil {
-            replyNoteLabel.text = "正在生成候选回复…"
         } else {
             replyNoteLabel.text = outcome.repliesUnranked
                 ? "排序失败，按生成顺序展示"
@@ -95,7 +95,7 @@ final class LiveSessionViewController: UIViewController {
     }
 
     private func renderTranscript() {
-        guard let latest = coordinator.latest, !latest.segments.isEmpty else {
+        guard let latest = coordinator.latest else {
             transcriptLabel.attributedText = NSAttributedString(
                 string: "开始录屏并打开一个聊天窗口，这里会显示逐屏拼接出的聊天记录。",
                 attributes: [.foregroundColor: UIColor.secondaryLabel, .font: UIFont.preferredFont(forTextStyle: .footnote)]
@@ -105,12 +105,24 @@ final class LiveSessionViewController: UIViewController {
         let body = UIFont.preferredFont(forTextStyle: .subheadline)
         let caption = UIFont.preferredFont(forTextStyle: .caption1)
         let text = NSMutableAttributedString()
+        text.append(NSAttributedString(string: "—— 当前屏 OCR（不依赖长图）——\n", attributes: [
+            .font: caption, .foregroundColor: UIColor.secondaryLabel
+        ]))
+        for message in latest.currentMessages {
+            let speaker = message.side == .me ? "我" : (message.side == .other ? "对方" : "未知")
+            text.append(NSAttributedString(string: "\(speaker)：\(message.text)\(message.clipped ? "（部分可见）" : "")\n",
+                                          attributes: [.font: body, .foregroundColor: UIColor.label]))
+        }
+        if latest.currentMessages.isEmpty {
+            text.append(NSAttributedString(string: "本屏尚未识别到可读文字\n", attributes: [.font: caption]))
+        }
+        text.append(NSAttributedString(string: "\n"))
         // 实时段放最后，和聊天 App 里“越往下越新”的阅读顺序一致。
         let ordered = latest.segments.filter { !$0.isLive } + latest.segments.filter(\.isLive)
         for (index, segment) in ordered.enumerated() {
             let count = segment.messages.filter { $0.kind == .message }.count
             let header = segment.isLive
-                ? "—— 最新片段 · \(count) 条 · 长图 \(segment.rungCount) 张 ——\n"
+                ? "—— 最新片段 · \(count) 条 · 长图 \(coordinator.longScreenshotSummary[segment.id]?.rungCount ?? 0) 张 ——\n"
                 : "—— 历史片段 \(index + 1) · \(count) 条（与其他片段之间可能有缺口）——\n"
             text.append(NSAttributedString(string: header, attributes: [
                 .font: caption, .foregroundColor: UIColor.secondaryLabel

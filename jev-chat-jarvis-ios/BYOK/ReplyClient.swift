@@ -98,7 +98,14 @@ struct ReplyClient {
                 detail: "模型只返回了 \(unique.count) 条有效候选，需要 3 条不重复的回复"
             )
         }
-        return Array(unique.prefix(3))
+        let result = Array(unique.prefix(3))
+        guard ReplyBundle.hasValidCandidateTexts(result) else {
+            throw APIError(
+                route: .reply, status: nil,
+                detail: "候选回复过长，每条最多支持 \(ReplyBundle.maxCandidateLength) 字，请重新生成"
+            )
+        }
+        return result
     }
 }
 

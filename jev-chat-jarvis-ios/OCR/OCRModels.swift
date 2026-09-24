@@ -1,6 +1,36 @@
 import CoreGraphics
 import Foundation
 
+nonisolated struct LongScreenshotInput: Sendable {
+    let epoch: UUID
+    let sessionID: UUID
+    let conversationID: UUID?
+    let frameID: UUID
+    let bitmap: FrameBitmap
+    let parsed: ParsedChatFrame
+    let placement: StitchPlacement
+    let activeSegmentIDs: Set<UUID>
+    let preferredSegmentID: UUID
+}
+
+nonisolated struct LongScreenshotMerge: Sendable {
+    let conversationID: UUID?
+    let sourceID: UUID
+    let targetID: UUID
+    let shift: CGFloat
+}
+
+nonisolated struct EngineOutput: Sendable {
+    let update: EngineUpdate
+    let longScreenshot: LongScreenshotInput?
+}
+
+nonisolated struct RecognizedChatFrame: Sendable {
+    let bitmap: FrameBitmap
+    let parsed: ParsedChatFrame
+    let ocrMilliseconds: Int
+}
+
 /// 一行 OCR 文字。`rect` 是帧像素坐标，原点在左上角（已从 Vision 的左下归一化坐标换算）。
 nonisolated struct OCRLine: Sendable, Equatable {
     let text: String
@@ -63,6 +93,7 @@ nonisolated struct ParsedChatFrame: Sendable {
     /// 从上到下排序，包括时间分隔线。
     let bubbles: [ChatBubble]
     let keyboardVisible: Bool
+    let inputBarVisible: Bool
     /// 本帧测到的正文字高，用来过滤图片里的小字，也用于学习本会话的稳定字高。
     let bodyLineHeight: CGFloat
     /// Jarvis 自己的界面（画中画）在帧里占掉的区域，压住的气泡按“显示不完整”处理。
@@ -72,13 +103,27 @@ nonisolated struct ParsedChatFrame: Sendable {
 
     var messageBubbles: [ChatBubble] { bubbles.filter { $0.kind == .message } }
 
+    /// 单张截图足够清楚即可分析；无标题时需要更强的版式或输入栏证据。
+    var hasReliableSingleFrameEvidence: Bool {
+        guard isChat else { return false }
+        // 裁切表示内容可能不完整，不代表无法识别聊天身份；业务仍保留此质量标记。
+        let complete = messageBubbles.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.sideConfidence >= 0.8 }
+        guard !complete.isEmpty else { return false }
+        if titleAnchored, !ChatLayoutParser.isTransientTitle(title), chatScore >= 0.64 { return true }
+        if complete.count >= 2, chatScore >= 0.75 { return true }
+        if complete.count >= 2, (keyboardVisible || inputBarVisible), chatScore >= 0.68 {
+            return true
+        }
+        return false
+    }
+
     /// 一条消息都没有，但确实是同一个聊天页（整屏都是图片时会出现）。
     /// 不能当成“不是聊天页”，否则会把会话切断。
     func continuingChat(reason: String) -> ParsedChatFrame {
         ParsedChatFrame(
             frameID: frameID, capturedAt: capturedAt, pixelSize: pixelSize, chatScore: chatScore, isChat: true,
             title: title, titleAnchored: titleAnchored, contentTop: contentTop, contentBottom: contentBottom,
-            headerBottom: headerBottom, bubbles: bubbles, keyboardVisible: keyboardVisible,
+            headerBottom: headerBottom, bubbles: bubbles, keyboardVisible: keyboardVisible, inputBarVisible: inputBarVisible,
             bodyLineHeight: bodyLineHeight, occluders: occluders, rejectReason: reason
         )
     }

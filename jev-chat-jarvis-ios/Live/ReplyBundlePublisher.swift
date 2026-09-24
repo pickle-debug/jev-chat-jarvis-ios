@@ -1,91 +1,101 @@
 import Foundation
 
-/// 把实时分析的候选回复发布给 Jarvis 键盘（`ReplyBundle`，架构文档 §8.3）。
-///
-/// - 只有“会话已确认 + 标题可读 + 三条有效候选 + 已完成排序 + 结论未过期”才写 ready；
-/// - 主 App 仍看到同一会话、同一内容时才续期 `validUntil`（最长不超过 `expiresAt`），不靠定时器无条件续期；
-/// - 停采、换会话、离开聊天页、内容更新：写 invalid 并清空候选；
-/// - 键盘自己也按时间失效：主 App 被挂起或终止时来不及写 invalid。
+/// 将独立完成的回复候选发布给键盘，不等待 Jev 判断或长图拼接。
 @MainActor
 final class ReplyBundlePublisher {
-    /// 推荐的最长有效时间。
     static let maxLifetime: TimeInterval = 120
-    /// 来源新鲜度窗口：这么久没有再确认同一会话同一内容，键盘就不再允许插入。
     static let freshness: TimeInterval = 15
-    /// 续期写文件的最小间隔。
     static let renewInterval: TimeInterval = 3
 
     private var published: ReplyBundle?
     private var lastWrite = Date.distantPast
-    private(set) var isReady = false
+    private var writeFailed = false
 
-    init() {
-        // 启动时清掉上次残留的 ready：那时的会话状态已无法确认。
-        ReplyBundleStore.write(.invalid(note: "Jarvis 已重新启动，等待新的建议"))
+    var isReady: Bool { !writeFailed && published?.isUsable() == true }
+    var unavailableReason: String {
+        if writeFailed { return "候选共享写入失败，请返回 Jarvis 检查" }
+        guard let published else { return "等待回复候选" }
+        if published.status == .invalid { return published.note ?? "等待回复候选" }
+        if Date() >= published.expiresAt { return "候选已过期，请重新分析" }
+        if Date() >= published.validUntil { return "等待当前聊天画面更新" }
+        return "候选暂不可用"
     }
 
-    func refresh(latest: EngineUpdate?, scheduler: LiveAnalysisScheduler, capturing: Bool) {
+    init() { write(.invalid(note: "Jarvis 已启动，等待回复候选")) }
+
+    func refresh(context: ConversationContext?, currentRequest: AnalysisRequest?,
+                 judge: LiveAnalysisScheduler.Outcome?, replies: ReplySuggestionScheduler.Outcome?,
+                 replyPhase: ReplySuggestionScheduler.Phase, capturing: Bool, captureNote: String) {
+        guard capturing else { return invalidate(captureNote) }
+        guard let context, !context.tailSignature.isEmpty else {
+            return invalidate("本屏尚未识别到可读聊天文字")
+        }
         let now = Date()
-        guard capturing, let latest, latest.detection == .chat, latest.confirmed,
-              let title = latest.title, !ChatLayoutParser.isTransientTitle(title),
-              let outcome = scheduler.outcome, !outcome.stale, !outcome.repliesUnranked,
-              // 同一内容 = 尾部签名不变。用户往上翻只在长图顶部补旧消息，revision 会变但尾部不变，仍然有效。
-              outcome.conversationID == latest.conversationID,
-              LiveAnalysisScheduler.signature(of: latest.liveMessages) == outcome.signature,
-              let replies = outcome.replies, replies.count == 3,
-              Set(replies.map(\.text)).count == 3, replies.allSatisfy({ !$0.text.isEmpty })
-        else {
-            invalidate(reason: Self.reason(latest: latest, scheduler: scheduler, capturing: capturing))
+        guard now >= context.observedAt.addingTimeInterval(-5), now < context.observedAt.addingTimeInterval(Self.freshness) else {
+            return invalidate("等待当前聊天画面更新")
+        }
+        switch replyPhase {
+        case .idle: return invalidate("等待回复任务")
+        case .generating: return invalidate("正在生成候选文案…")
+        case .ranking: return invalidate("正在排序候选文案…")
+        case .failed(let reason): return invalidate(reason)
+        case .ready: break
+        }
+        guard let request = currentRequest, let replies, !replies.stale,
+              replies.request.id == request.id, replies.request.version == request.version,
+              request.version.sessionID == context.sessionID, request.version.conversationID == context.conversationID,
+              request.version.tailSignature == context.tailSignature else {
+            return invalidate("当前聊天已更新，等待新的回复候选")
+        }
+        guard !replies.repliesUnranked, replies.error == nil else {
+            return invalidate(replies.error ?? "候选排序尚未完成")
+        }
+        guard ReplyBundle.hasValidCandidateTexts(replies.replies.map(\.text)) else {
+            return invalidate("需要三条不同、长度有效的候选回复")
+        }
+        let generatedAt = replies.completedAt
+        let expiresAt = generatedAt.addingTimeInterval(Self.maxLifetime)
+        guard now >= generatedAt.addingTimeInterval(-5), now < expiresAt else {
+            return invalidate("候选已过期，请重新分析")
+        }
+        let validUntil = min(expiresAt, context.observedAt.addingTimeInterval(Self.freshness))
+        let summary = judge.flatMap { result -> String? in
+            guard !result.stale, result.request.id == request.id,
+                  result.request.version == request.version else { return nil }
+            return result.analysis.map(JudgeLabels.summary)
+        }
+        let confidence = context.sourceConfirmed ? "confirmed" : "recognized"
+        if var current = published, current.status == .ready, current.analysisRequestID == request.id.uuidString,
+           current.sourceTitle == context.sourceTitle, current.sourceConfidence == confidence {
+            guard writeFailed || current.summary != summary
+                || (validUntil > current.validUntil && now.timeIntervalSince(lastWrite) >= Self.renewInterval) else { return }
+            current.summary = summary
+            current.validUntil = validUntil
+            write(current)
             return
         }
+        let candidates = replies.replies.reversed().enumerated().map {
+            ReplyBundle.Candidate(id: UUID().uuidString, rank: $0.offset + 1, text: $0.element.text)
+        }
+        write(ReplyBundle(bundleID: UUID().uuidString, status: .ready, sessionID: context.sessionID.uuidString,
+                          conversationID: context.conversationID.uuidString, revision: request.context.revision,
+                          analysisRequestID: request.id.uuidString, generatedAt: generatedAt, expiresAt: expiresAt,
+                          validUntil: validUntil, sourceTitle: context.sourceTitle, sourceConfidence: confidence,
+                          summary: summary, candidates: candidates, note: nil))
+    }
 
-        if var current = published, current.status == .ready, current.analysisRequestID == outcome.requestID.uuidString {
-            // 同一份结论：只续期来源新鲜度。
-            guard now.timeIntervalSince(lastWrite) >= Self.renewInterval else { return }
-            current.validUntil = min(current.expiresAt, now.addingTimeInterval(Self.freshness))
-            write(current, now: now)
+    private func invalidate(_ reason: String) {
+        guard writeFailed || published?.status != .invalid || published?.note != reason else { return }
+        write(.invalid(note: reason))
+    }
+
+    private func write(_ bundle: ReplyBundle) {
+        guard ReplyBundleStore.write(bundle) else {
+            writeFailed = true
             return
         }
-
-        // `replies` 是按推荐程度降序；键盘上 rank 1 最低、3 最高。
-        let candidates = replies.reversed().enumerated().map { index, reply in
-            ReplyBundle.Candidate(id: UUID().uuidString, rank: index + 1, text: reply.text)
-        }
-        let bundle = ReplyBundle(
-            bundleID: UUID().uuidString, status: .ready,
-            sessionID: latest.sessionID.uuidString,
-            conversationID: outcome.conversationID.uuidString,
-            revision: outcome.revision,
-            analysisRequestID: outcome.requestID.uuidString,
-            generatedAt: now,
-            expiresAt: now.addingTimeInterval(Self.maxLifetime),
-            validUntil: now.addingTimeInterval(Self.freshness),
-            sourceTitle: title, sourceConfidence: "confirmed",
-            summary: outcome.analysis.map(JudgeLabels.summary),
-            candidates: candidates, note: nil
-        )
-        write(bundle, now: now)
-    }
-
-    private func invalidate(reason: String) {
-        guard published?.status != .invalid else { return }
-        write(.invalid(note: reason), now: Date())
-    }
-
-    private func write(_ bundle: ReplyBundle, now: Date) {
-        ReplyBundleStore.write(bundle)
+        writeFailed = false
         published = bundle
-        lastWrite = now
-        isReady = bundle.status == .ready
-    }
-
-    private static func reason(latest: EngineUpdate?, scheduler: LiveAnalysisScheduler, capturing: Bool) -> String {
-        guard capturing else { return "录屏已停止" }
-        guard let latest, latest.detection == .chat else { return "当前不在聊天页" }
-        guard latest.confirmed, latest.title != nil else { return "还没确认当前会话" }
-        guard let outcome = scheduler.outcome else { return "等待对方新消息" }
-        if outcome.stale { return "会话有新内容，正在等待新的建议" }
-        if outcome.repliesUnranked { return "候选排序失败，未发布到键盘" }
-        return "候选回复生成中"
+        lastWrite = Date()
     }
 }
